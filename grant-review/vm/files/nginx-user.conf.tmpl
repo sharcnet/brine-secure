@@ -1,0 +1,22 @@
+# One per reviewer, written by add-reviewer to /etc/nginx/brine-users/@USER@.conf (0600).
+server {
+    listen unix:/run/brine-proxy/@USER@/brine.sock;
+    access_log /var/log/nginx/brine-@USER@.access.log brine_meta;   # metadata only
+    client_max_body_size 50m;
+
+    # Only plain URLs: no dot segments, percent-encoding, doubled slashes or query strings.
+    # That way the path nginx matches is exactly the path brine receives.
+    if ($request_uri ~ "(\.\.|%|//|\?)") { return 403; }
+
+    # proxy_set_header only inherits when a block sets none of its own, so the snippet and
+    # the Authorization header have to sit in the same location.
+    location = /v1/chat/completions {
+        include snippets/brine-proxy.conf;
+        proxy_set_header Authorization "Bearer @KEY@";
+    }
+    location = /v1/models {
+        include snippets/brine-proxy.conf;
+        proxy_set_header Authorization "Bearer @KEY@";
+    }
+    location / { return 403; }
+}

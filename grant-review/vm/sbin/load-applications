@@ -1,0 +1,36 @@
+#!/bin/bash
+# load-applications <assignment.csv>
+#
+# The competition owner's assignment list as CSV lines "username,filename". The files must
+# already be in /srv/review/staging. Everything is checked before anything is copied. The
+# script never opens or parses an application: it only copies and hashes bytes.
+source /usr/local/lib/brine-review/common.sh
+
+[[ $# -eq 1 && -f $1 ]] || die "usage: load-applications <assignment.csv>"
+stage=$SRV/staging
+declare -a pairs=()
+declare -A seen=()
+
+while IFS=, read -r u f || [[ -n $u ]]; do
+  u=${u//$'\r'/}; f=${f//$'\r'/}
+  [[ -z $u || $u == username ]] && continue
+  need_reviewer "$u"
+  valid_file "$f" || die "bad filename: $f"
+  [[ -f $stage/$f && ! -L $stage/$f ]] || die "missing or not a plain file: $stage/$f"
+  [[ -z ${seen[$u/$f]:-} ]] || die "listed twice: $u,$f"
+  [[ ! -e $SRV/originals/$u/$f ]] || die "already loaded for $u: $f"
+  seen[$u/$f]=1
+  pairs+=("$u/$f")
+done < "$1"
+(( ${#pairs[@]} )) || die "nothing to load"
+
+for p in "${pairs[@]}"; do
+  u=${p%%/*}; f=${p#*/}
+  install -o root -g root -m 0444 "$stage/$f" "$SRV/originals/$u/$f"
+done
+for u in $(printf '%s\n' "${pairs[@]%%/*}" | sort -u); do
+  write_manifest "$u"
+  log "loaded applications for $u"
+done
+echo "Loaded ${#pairs[@]} file(s). Next: a second person compares each manifest with the"
+echo "assignment list (review manifest <user>), then activate-reviewer."

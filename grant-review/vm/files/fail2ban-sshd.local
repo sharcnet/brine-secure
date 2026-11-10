@@ -1,0 +1,5 @@
+# /etc/fail2ban/jail.d/sshd.local. configure fills in the admin addresses so admins can't ban
+# themselves.
+[sshd]
+enabled = true
+ignoreip = 127.0.0.1/8 ::1 @ADMIN_CIDRS@

@@ -1,0 +1,30 @@
+# Quadlet template. configure fills in the limits; add-reviewer fills in @USER@ and writes
+# /etc/containers/systemd/review-<user>.container.
+# [VERIFY] every key against podman-systemd.unit(5) for the installed Podman version.
+[Unit]
+Description=Grant review container for @USER@
+Requires=nginx.service
+After=nginx.service
+
+[Container]
+Image=localhost/brine-review:current
+ContainerName=review-@USER@
+HostName=review
+Network=none
+UserNS=auto
+ReadOnly=true
+DropCapability=all
+NoNewPrivileges=true
+# Order matters: originals is mounted inside the home mount.
+Volume=/srv/review/homes/@USER@:/home/reviewer:U
+Volume=/srv/review/originals/@USER@:/home/reviewer/originals:ro
+Volume=/run/brine-proxy/@USER@:/run/brine:ro
+Volume=/etc/brine-review/models.json:/home/reviewer/.pi/agent/models.json:ro
+Tmpfs=/tmp:rw,size=256m,nosuid,nodev,noexec
+PodmanArgs=--memory=@CTR_MEMORY@ --cpus=@CTR_CPUS@ --pids-limit=@CTR_PIDS@
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

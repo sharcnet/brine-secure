@@ -1,0 +1,27 @@
+#!/bin/bash
+# setup-data-volume <device>      e.g. /dev/vdb
+#
+# Formats the (encrypted Cinder) data volume with project quotas and mounts it at
+# /srv/review. Refuses any device that already holds a filesystem or partition table, so it
+# can't wipe data. Runs before configure, so it doesn't use common.sh.
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+die() { echo "error: $*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || die "run as root"
+[[ $# -eq 1 && -b $1 ]] || die "usage: setup-data-volume <block-device>"
+dev=$1
+[[ -z $(blkid -p "$dev" 2>/dev/null) ]] || die "$dev already has a filesystem or partition table; refusing"
+findmnt -rno SOURCE | grep -qx "$dev" && die "$dev is mounted"
+mountpoint -q /srv/review && die "/srv/review is already a mount point"
+
+mkfs.ext4 -q -L brine-review -O quota,project "$dev"     # [VERIFY] project quota feature
+uuid=$(blkid -s UUID -o value "$dev")
+install -d -m 0711 /srv/review
+grep -q "UUID=$uuid" /etc/fstab \
+  || printf 'UUID=%s /srv/review ext4 nodev,nosuid,noexec,prjquota 0 2\n' "$uuid" >> /etc/fstab
+systemctl daemon-reload
+mount /srv/review
+chmod 0711 /srv/review
+findmnt /srv/review
+logger -t brine-review "formatted $dev ($uuid) and mounted /srv/review"

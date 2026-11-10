@@ -8,3 +8,7 @@ clouds.yaml
 .ssh/
 .venv/
 .sandbox.lock/
+grant-review/review.env
+grant-review/.ssh/
+grant-review/image/brine-review-*.tar*
+grant-review/image/brine-review-*.versions

@@ -1,0 +1,33 @@
+#!/bin/bash
+# Called by sshd's ForceCommand via sudo. Takes no trusted input except SUDO_USER.
+# Installed root:root 0755 at /usr/local/sbin/enter-review. Deliberately does not source
+# common.sh: keep the code a reviewer's login runs through as small as possible.
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+user="${SUDO_USER:-}"
+[[ "$user" =~ ^[a-z][a-z0-9_-]{0,30}$ ]] || { echo "denied" >&2; exit 1; }
+id -nG "$user" | tr ' ' '\n' | grep -qx reviewers || { echo "denied" >&2; exit 1; }
+
+ctr="review-$user"
+cmd="${SSH_ORIGINAL_COMMAND:-}"
+term="${TERM:-xterm-256color}"
+[[ "$term" =~ ^[A-Za-z0-9._+-]{1,40}$ ]] || term=xterm-256color
+
+# configure sets this from REVIEWER_SHELL: "bash" or "pi".
+SHELL_CMD=(@SHELL_CMD@)
+
+case "$cmd" in
+  "")
+    [ -t 0 ] || { echo "interactive sessions need a terminal" >&2; exit 1; }
+    exec podman exec -it --user reviewer -w /home/reviewer -e TERM="$term" "$ctr" "${SHELL_CMD[@]}"
+    ;;
+  sftp|internal-sftp|/usr/lib/openssh/sftp-server)
+    # -R: read-only. Reviewers can download, never upload. [VERIFY] with test 28, and what
+    # SSH_ORIGINAL_COMMAND holds for a subsystem request on this OpenSSH version.
+    exec podman exec -i --user reviewer -w /home/reviewer "$ctr" /usr/lib/openssh/sftp-server -R
+    ;;
+  *)
+    echo "remote commands are not allowed" >&2; exit 1
+    ;;
+esac

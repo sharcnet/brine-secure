@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# Admin CLI for the grant-review VM. Runs on an admin's laptop (macOS bash 3.2 is fine).
+# Reads ./review.env (copy review.env.example). Run `review help` for the commands.
+#
+# Secrets never go into command arguments: the LiteLLM admin credential is a header file,
+# and each new reviewer key is held in a shell variable and piped to the VM over SSH.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd -P)
+repo=$(cd "$here/.." && pwd -P)
+die() { echo "error: $*" >&2; exit 1; }
+confirm() { local a; read -r -p "$1 Type '$2' to continue: " a; [[ $a == "$2" ]] || die "cancelled"; }
+valid_user() { [[ ${1:-} =~ ^[a-z][a-z0-9_-]{0,30}$ ]]; }
+valid_file() { [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$ ]]; }
+
+[[ -r $here/review.env ]] || die "copy review.env.example to review.env and fill it in"
+# shellcheck source=/dev/null
+source "$here/review.env"
+: "${VM_ADMIN:=ubuntu}" "${BRINE_URL:=https://brine.sharcnet.ca}"
+brine_host=${BRINE_URL#https://}; brine_host=${brine_host%%/*}
+
+# ---------- helpers ----------
+
+os() {
+  if command -v openstack >/dev/null; then openstack "$@"
+  else command -v uv >/dev/null || die "need the openstack CLI (or uv; see the top-level README)"
+       uv run --project "$repo" openstack "$@"; fi
+}
+
+brine_ips_json() {
+  local ips=${BRINE_IPS:-}
+  [[ -n $ips ]] || ips=$(dig +short A "$brine_host" | grep -E '^[0-9.]+$' | sort -u | tr '\n' ' ')
+  [[ -n ${ips// /} ]] || die "cannot resolve $brine_host (set BRINE_IPS in review.env)"
+  printf '%s\n' $ips | jq -R . | jq -cs .
+}
+
+tf() {
+  command -v terraform >/dev/null || die "terraform not installed"
+  local sub=$1; shift
+  terraform -chdir="$here/terraform" "$sub" -var "brine_ips=$(brine_ips_json)" "$@"
+}
+
+vm_ip() {
+  if [[ -n ${VM_HOST:-} ]]; then echo "$VM_HOST"
+  else terraform -chdir="$here/terraform" output -raw ip 2>/dev/null || die "no VM yet (review apply)"; fi
+}
+
+vm_ssh() {
+  local tty=""
+  [[ ${1:-} == -t ]] && { tty=-t; shift; }
+  [[ -s $here/.ssh/known_hosts ]] || die "host key not pinned yet: review pin-hostkey"
+  ssh $tty -o HostKeyAlias=review-vm -o UserKnownHostsFile="$here/.ssh/known_hosts" \
+      -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
+      ${ADMIN_SSH_KEY:+-i "$ADMIN_SSH_KEY"} "$VM_ADMIN@$(vm_ip)" "$@"
+}
+
+# Copy vm/ plus a generated review.conf to /root/brine-review-src on the VM.
+push_src() {
+  local t rc=0; t=$(mktemp -d)
+  cp -R "$here/vm/." "$t/"
+  {
+    printf 'BRINE_HOST=%q\n' "$brine_host"
+    printf 'ADMIN_CIDRS=%q\n' "$ADMIN_CIDRS"
+    printf 'QUOTA_GB=%q\n' "${QUOTA_GB:-2}"
+    printf 'REVIEWER_SHELL=%q\n' "${REVIEWER_SHELL:-bash}"
+    printf 'CTR_MEMORY=%q\nCTR_CPUS=%q\nCTR_PIDS=%q\n' "${CTR_MEMORY:-2g}" "${CTR_CPUS:-2}" "${CTR_PIDS:-256}"
+  } > "$t/review.conf"
+  COPYFILE_DISABLE=1 tar -C "$t" -cf - . | vm_ssh 'sudo -n rm -rf /root/brine-review-src &&
+    sudo -n install -d -m 0700 /root/brine-review-src &&
+    sudo -n tar --no-same-owner -C /root/brine-review-src -xf -' || rc=$?
+  rm -rf "$t"
+  return $rc
+}
+
+# LiteLLM admin call. Body on stdin; credential from the header file; key stays in memory.
+litellm() {
+  [[ -r ${LITELLM_ADMIN_HEADER:-} ]] || die "LITELLM_ADMIN_HEADER must name a 0600 file holding 'Authorization: Bearer ...'"
+  curl -fsS -X POST "$BRINE_URL/$1" -H @"$LITELLM_ADMIN_HEADER" \
+       -H 'Content-Type: application/json' --data-binary @-
+}
+
+key_alias_of() {
+  vm_ssh "sudo -n awk '\$2 == \"$1\" { print \$1 }' /etc/brine-review/keys/aliases" | tail -1
+}
+
+revoke_alias() {
+  # [VERIFY] /key/delete accepts key_aliases on brine's LiteLLM version.
+  jq -n --arg a "$1" '{key_aliases: [$a]}' | litellm key/delete >/dev/null \
+    && echo "revoked LiteLLM key $1" \
+    || { echo "REVOKE FAILED for $1: revoke it on brine by hand" >&2; return 1; }
+}
+
+check_lock() {
+  local port group sgs
+  port=$(terraform -chdir="$here/terraform" output -raw port_id)
+  group=$(terraform -chdir="$here/terraform" output -raw review_group_id)
+  sgs=$(os port show "$port" -f json -c security_group_ids | jq -c '.security_group_ids')
+  [[ $sgs == "[\"$group\"]" ]] || die "VM port has extra security groups: $sgs"
+  echo "port: only $group attached. Its egress rules:"
+  os security group rule list "$group" --egress -f value -c "IP Protocol" -c "IP Range" -c "Port Range" | sed 's/^/  /'
+  if [[ -s $here/.ssh/known_hosts ]]; then
+    echo "open connections on the VM (expect only SSH and brine :443):"
+    vm_ssh 'ss -tnH state established' | awk '{print "  " $3 " -> " $4}'
+  else
+    echo "host key not pinned yet: run review pin-hostkey, then review check"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+review plan | apply                 Terraform plan / apply (egress locked)
+review pin-hostkey                  Pin the VM's SSH host key from its console log
+review setup-egress on|off          Open egress for first setup only (refused once data exists)
+review data-volume <device>         Format and mount the encrypted data volume (once)
+review deploy [--admin-access]      Copy vm/ to the VM and run configure
+review image <tar>                  Install an image made by image/build
+review add <user> <pubkey-file>     Mint a LiteLLM key and create the reviewer (login off)
+review stage <file>...              Copy applications into staging on the encrypted volume
+review load <assignment.csv>        Load staged applications (username,filename lines)
+review manifest <user>              Show a reviewer's manifest for the second-person check
+review activate <user> <checked-by> Switch the reviewer's login on
+review unload <user> <file>         Remove one application (conflict of interest)
+review remove <user>                Remove a reviewer, purge their data, revoke their key
+review revoke <user>                Revoke a reviewer's LiteLLM key only
+review check                        Control-plane lock check and open connections
+review ssh                          Admin shell on the VM
+EOF
+}
+
+# ---------- commands ----------
+
+cmd=${1:-help}; shift || true
+case $cmd in
+  plan)  tf plan "$@" ;;
+  apply) tf apply -var setup_egress=false "$@"; check_lock ;;
+
+  pin-hostkey)
+    sid=$(terraform -chdir="$here/terraform" output -raw server_id)
+    key=$(os console log show "$sid" | tr -d '\r' \
+          | sed -n '/BEGIN SSH HOST KEY KEYS/,/END SSH HOST KEY KEYS/p' | grep '^ssh-ed25519 ' | head -1)
+    [[ -n $key ]] || die "no ed25519 host key in the console log yet; wait for cloud-init and retry"
+    mkdir -p "$here/.ssh" && chmod 700 "$here/.ssh"
+    printf 'review-vm %s\n' "$(cut -d' ' -f1-2 <<<"$key")" > "$here/.ssh/known_hosts"
+    echo "pinned: $(ssh-keygen -lf "$here/.ssh/known_hosts" | cut -d' ' -f2)"
+    echo "Send this fingerprint to reviewers through a separate channel."
+    ;;
+
+  setup-egress)
+    case ${1:-} in
+      on)
+        if [[ -s $here/.ssh/known_hosts ]]; then
+          n=$(vm_ssh 'sudo -n find /srv/review/originals /srv/review/staging -type f 2>/dev/null | wc -l') \
+            || die "can't check the VM for applications; refusing"
+          [[ ${n// /} -eq 0 ]] || die "applications are on the VM; open egress is never allowed again"
+        fi
+        confirm "This opens all egress from the VM." open
+        tf apply -var setup_egress=true ;;
+      off) tf apply -var setup_egress=false; check_lock ;;
+      *) die "usage: review setup-egress on|off" ;;
+    esac ;;
+
+  data-volume)
+    [[ ${1:-} =~ ^/dev/[a-z0-9]+$ ]] || die "usage: review data-volume /dev/vdX (see: terraform output volume_device)"
+    confirm "Format $1 on the VM? It refuses if $1 already holds anything." format
+    push_src
+    vm_ssh -t "sudo -n /root/brine-review-src/sbin/setup-data-volume $1" ;;
+
+  deploy)
+    [[ -z ${1:-} || $1 == --admin-access ]] || die "usage: review deploy [--admin-access]"
+    push_src
+    vm_ssh -t "sudo -n bash /root/brine-review-src/configure ${1:-}" ;;
+
+  image)
+    tar=${1:-}; [[ -f $tar && -f $tar.sha256 ]] || die "usage: review image <brine-review-*.tar> (with .sha256 beside it)"
+    sum=$(< "$tar.sha256"); [[ $sum =~ ^[0-9a-f]{64}$ ]] || die "bad checksum file"
+    vm_ssh "sudo -n sh -c 'umask 077; cat > /root/brine-review-image.tar'" < "$tar"
+    vm_ssh "sudo -n /usr/local/sbin/install-image /root/brine-review-image.tar $sum; sudo -n rm -f /root/brine-review-image.tar" ;;
+
+  add)
+    u=${1:-} pub=${2:-}
+    valid_user "$u" && [[ -f $pub ]] || die "usage: review add <user> <pubkey-file>"
+    for v in LITELLM_TEAM_ID MODELS KEY_DURATION KEY_BUDGET KEY_RPM KEY_TPM; do
+      [[ -n ${!v:-} ]] || die "review.env: $v is not set"
+    done
+    alias_id="gr-$(openssl rand -hex 4)"
+    vm_ssh "umask 077; cat > /tmp/review-$u.pub" < "$pub"
+    resp=$(jq -n --arg team "$LITELLM_TEAM_ID" --arg alias "$alias_id" --arg dur "$KEY_DURATION" \
+             --argjson models "$(printf '%s\n' $MODELS | jq -R . | jq -cs .)" \
+             --argjson budget "$KEY_BUDGET" --argjson rpm "$KEY_RPM" --argjson tpm "$KEY_TPM" \
+             '{team_id: $team, key_alias: $alias, models: $models, duration: $dur,
+               max_budget: $budget, rpm_limit: $rpm, tpm_limit: $tpm}' \
+           | litellm key/generate)                       # [VERIFY] field names on brine's version
+    key=$(printf '%s' "$resp" | jq -r '.key // empty'); unset resp
+    [[ -n $key ]] || die "brine returned no key"
+    if ! printf '%s\n' "$key" | vm_ssh "sudo -n /usr/local/sbin/add-reviewer $u /tmp/review-$u.pub $alias_id"; then
+      unset key; vm_ssh "rm -f /tmp/review-$u.pub" || true
+      revoke_alias "$alias_id" || true
+      die "add-reviewer failed; key $alias_id revoked. Clean up with: review remove $u"
+    fi
+    unset key
+    vm_ssh "rm -f /tmp/review-$u.pub" ;;
+
+  stage)
+    (( $# )) || die "usage: review stage <file>..."
+    for f in "$@"; do
+      n=$(basename "$f")
+      [[ -f $f ]] && valid_file "$n" || die "not a plain file with a plain name: $f"
+    done
+    for f in "$@"; do
+      n=$(basename "$f")
+      # Streamed straight onto the encrypted volume: no copy lands on the VM's root disk.
+      vm_ssh "sudo -n sh -c 'umask 077; set -C; cat > /srv/review/staging/$n'" < "$f" \
+        || die "could not stage $n (already staged?)"
+      echo "staged $n"
+    done ;;
+
+  load)
+    [[ -f ${1:-} ]] || die "usage: review load <assignment.csv>"
+    csv=/srv/review/staging/.assignment-$(date +%Y%m%d%H%M%S).csv
+    vm_ssh "sudo -n sh -c 'umask 077; cat > $csv'" < "$1"
+    vm_ssh "sudo -n /usr/local/sbin/load-applications $csv" ;;
+
+  manifest)
+    valid_user "${1:-}" || die "usage: review manifest <user>"
+    vm_ssh "sudo -n cat /srv/review/manifests/$1.sha256" | awk '{print $2}' ;;
+
+  activate)
+    valid_user "${1:-}" && [[ -n ${2:-} ]] || die "usage: review activate <user> <checked-by>"
+    [[ $2 =~ ^[A-Za-z][A-Za-z0-9._\ -]{1,60}$ ]] || die "bad checked-by name"
+    vm_ssh "sudo -n /usr/local/sbin/activate-reviewer $1 $(printf '%q' "$2")" ;;
+
+  unload)
+    valid_user "${1:-}" && valid_file "${2:-}" || die "usage: review unload <user> <file>"
+    vm_ssh "sudo -n /usr/local/sbin/unload-application $1 $2" ;;
+
+  remove)
+    u=${1:-}; valid_user "$u" || die "usage: review remove <user>"
+    confirm "This deletes $u's account, workspace and applications on the VM, and revokes their key. It can't be undone." "$u"
+    alias_id=$(key_alias_of "$u")
+    vm_ssh "sudo -n /usr/local/sbin/remove-reviewer $u --purge-data"
+    if [[ -n $alias_id ]]; then revoke_alias "$alias_id"; else echo "no key alias recorded for $u: check brine"; fi ;;
+
+  revoke)
+    u=${1:-}; valid_user "$u" || die "usage: review revoke <user>"
+    alias_id=$(key_alias_of "$u"); [[ -n $alias_id ]] || die "no key alias recorded for $u"
+    revoke_alias "$alias_id" ;;
+
+  check) check_lock ;;
+  ssh)   vm_ssh "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac

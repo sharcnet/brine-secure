@@ -1,0 +1,3 @@
+# /etc/sudoers.d/reviewers (0440). "" means no arguments are allowed.
+Defaults!/usr/local/sbin/enter-review env_keep += "SSH_ORIGINAL_COMMAND"
+%reviewers ALL=(root) NOPASSWD: /usr/local/sbin/enter-review ""

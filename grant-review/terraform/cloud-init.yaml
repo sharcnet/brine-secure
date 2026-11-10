@@ -1,0 +1,11 @@
+#cloud-config
+# No secrets here: user data is readable through the config drive and by anyone with a role
+# in the project. The admin key comes from the OpenStack keypair.
+ssh_pwauth: false
+disable_root: true
+package_update: false
+swap:
+  size: 0
+# Print host key fingerprints to the console log, where `review pin-hostkey` reads them.
+ssh_fp_console_blacklist: []
+ssh_key_console_blacklist: []

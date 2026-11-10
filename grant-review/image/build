@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Build the reviewer container image and save it as a tarball for install-image.
+# Run on a Linux x86_64 host with podman and internet access: a build VM or CI, NOT the
+# review VM once applications are on it. The one exception is the very first build, on the
+# review VM during setup (setup_egress = true), before any application is loaded.
+#
+# Output: brine-review-<tag>.tar and brine-review-<tag>.tar.sha256 in the current directory.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd -P)
+die() { echo "error: $*" >&2; exit 1; }
+
+command -v podman >/dev/null || die "podman not installed"
+[[ $(uname -m) == x86_64 ]] || die "build on x86_64 (the VM's architecture)"
+tag=$(date +%Y%m%d)
+[[ ! -e brine-review-$tag.tar ]] || tag=$tag-$(date +%H%M)
+img=localhost/brine-review:$tag
+
+podman build --pull=always -t "$img" "$here"
+
+# The image must not ship tools the design says it doesn't have.
+found=$(podman run --rm --network=none --entrypoint /bin/bash "$img" \
+  -c 'for t in curl wget python3 git ssh apt apt-get dpkg npm npx sudo gcc; do command -v $t; done' || true)
+[[ -z $found ]] || die "image contains: $found"
+podman run --rm --network=none --entrypoint /bin/bash "$img" \
+  -c 'pi --version; pdftotext -v 2>&1 | head -1; rg --version | head -1; fd --version; node --version' \
+  | tee "brine-review-$tag.versions"
+
+podman save -o "brine-review-$tag.tar" "$img"
+sha256sum "brine-review-$tag.tar" | awk '{print $1}' > "brine-review-$tag.tar.sha256"
+echo "Built $img"
+echo "Install: grant-review/review image $PWD/brine-review-$tag.tar"

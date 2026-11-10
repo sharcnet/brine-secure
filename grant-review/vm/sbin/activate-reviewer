@@ -1,0 +1,19 @@
+#!/bin/bash
+# activate-reviewer <username> <checked-by>
+#
+# Switches the reviewer's SSH login on. Run only after a second person has compared the
+# reviewer's manifest with the assignment list.
+source /usr/local/lib/brine-review/common.sh
+
+[[ $# -eq 2 ]] || die "usage: activate-reviewer <username> <checked-by>"
+u=$1 checker=$2
+need_reviewer "$u"
+[[ $checker =~ ^[A-Za-z][A-Za-z0-9._\ -]{1,60}$ ]] || die "bad checked-by name"
+[[ -f /etc/ssh/authorized_keys/$u.pending ]] || die "$u has no pending key (already active?)"
+[[ -s $SRV/manifests/$u.sha256 ]] || die "$u has no applications loaded"
+( cd "$SRV/originals/$u" && sha256sum --quiet -c "$SRV/manifests/$u.sha256" ) \
+  || die "$u's originals no longer match the manifest"
+systemctl is-active --quiet "review-$u.service" || die "review-$u.service is not running"
+
+mv -- "/etc/ssh/authorized_keys/$u.pending" "/etc/ssh/authorized_keys/$u"
+log "activated $u; manifest checked by $checker"

@@ -1,0 +1,40 @@
+# Built off the VM by ./build, then loaded on the VM with install-image.
+# Base image pinned by digest; pi and its dependencies pinned by package-lock.json.
+ARG NODE_IMAGE=docker.io/library/node:24.22.2-bookworm-slim@sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9ed5ab39e11cf6c70e9
+FROM ${NODE_IMAGE}
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      bash coreutils findutils grep less nano \
+      poppler-utils ripgrep fd-find \
+      openssh-sftp-server tini ca-certificates \
+ && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+ && rm -rf /var/lib/apt/lists/*
+
+# Exactly the dependency tree in the lockfile. --ignore-scripts: no install scripts run.
+# [VERIFY] pi works without them (koffi, protobufjs and @google/genai declare one).
+WORKDIR /opt/pi
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+ && ln -s /opt/pi/node_modules/.bin/pi /usr/local/bin/pi \
+ && npm cache clean --force \
+ && rm -rf /root/.npm
+
+# Remove package managers from the runtime image (there is no network anyway), drop the
+# image's default "node" user (uid 1000), add ours, and strip setuid/setgid bits.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+           /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
+ && rm -f /usr/bin/apt /usr/bin/apt-get /usr/bin/apt-cache /usr/bin/dpkg \
+ && (userdel -r node 2>/dev/null || true) \
+ && useradd -u 1000 -m -s /bin/bash reviewer \
+ && useradd -u 1001 -M -s /usr/sbin/nologin fwd \
+ && (find / -xdev -perm /6000 -type f -exec chmod a-s {} + 2>/dev/null || true)
+
+COPY brine-forward.js /opt/brine-forward.js
+COPY pi-review /usr/local/bin/pi-review
+COPY profile-review.sh /etc/profile.d/review.sh
+RUN chmod 0755 /usr/local/bin/pi-review && chmod 0644 /opt/brine-forward.js /etc/profile.d/review.sh
+
+WORKDIR /home/reviewer
+USER fwd
+ENTRYPOINT ["/usr/bin/tini", "--", "node", "/opt/brine-forward.js"]

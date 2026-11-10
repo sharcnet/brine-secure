@@ -1,0 +1,149 @@
+#!/bin/bash
+# configure [--admin-access]
+#
+# Sets up the review VM. Run as root from the copy that `review deploy` puts in
+# /root/brine-review-src, with review.conf next to it. Safe to run again: it converges.
+#
+# --admin-access also turns on pam_access (admins only from ADMIN_CIDRS). Keep a second
+# admin session open when you first use it. The OpenStack console is the way back in.
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 022
+shopt -u patsub_replacement 2>/dev/null || true
+src=$(cd "$(dirname "$0")" && pwd -P)
+die() { echo "error: $*" >&2; exit 1; }
+step() { echo "== $*"; }
+
+[[ $EUID -eq 0 ]] || die "run as root"
+admin_access=false
+[[ ${1:-} == --admin-access ]] && admin_access=true
+
+[[ -r $src/review.conf ]] || die "$src/review.conf missing (review deploy writes it)"
+# shellcheck source=/dev/null
+source "$src/review.conf"
+for v in BRINE_HOST ADMIN_CIDRS QUOTA_GB REVIEWER_SHELL CTR_MEMORY CTR_CPUS CTR_PIDS; do
+  [[ -n ${!v:-} ]] || die "review.conf: $v is not set"
+done
+[[ $BRINE_HOST =~ ^[a-z0-9.-]+$ ]] || die "bad BRINE_HOST"
+[[ $ADMIN_CIDRS =~ ^[0-9a-fA-F.:/\ ]+$ ]] || die "bad ADMIN_CIDRS"
+[[ $QUOTA_GB =~ ^[0-9]+$ && $CTR_CPUS =~ ^[0-9.]+$ && $CTR_PIDS =~ ^[0-9]+$ ]] || die "bad limits"
+[[ $CTR_MEMORY =~ ^[0-9]+[kmg]$ ]] || die "bad CTR_MEMORY"
+case $REVIEWER_SHELL in
+  bash) shell_cmd="/bin/bash -l" ;;
+  pi)   shell_cmd="/usr/local/bin/pi-review" ;;
+  *)    die "REVIEWER_SHELL must be bash or pi" ;;
+esac
+
+# The data volume comes first (setup-data-volume): everything confidential lives on it.
+mountpoint -q /srv/review || die "/srv/review is not mounted; run setup-data-volume first"
+opts=$(findmnt -no OPTIONS /srv/review)
+for o in nodev nosuid noexec prjquota; do
+  [[ ,$opts, == *,$o,* ]] || die "/srv/review is missing mount option $o"
+done
+[[ -z $(swapon --noheadings --show) ]] || die "swap is on; turn it off (it would hold content on the root disk)"
+
+# Fill @NAME@ placeholders with shell built-ins. Usage: fill <file> NAME=value ...
+fill() {
+  local out pair f=$1; shift
+  out="$(< "$f")"
+  for pair in "$@"; do out="${out//@${pair%%=*}@/${pair#*=}}"; done
+  printf '%s\n' "$out"
+}
+
+step "packages"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q
+apt-get install -y -q podman nginx nftables uidmap tini fail2ban quota jq unattended-upgrades
+dpkg-reconfigure -f noninteractive unattended-upgrades
+podman --version
+
+step "subordinate IDs for UserNS=auto"
+grep -q '^containers:' /etc/subuid || echo 'containers:2147483647:2147483648' >> /etc/subuid
+grep -q '^containers:' /etc/subgid || echo 'containers:2147483647:2147483648' >> /etc/subgid
+
+step "group and directories"
+getent group reviewers >/dev/null || groupadd --system reviewers
+gid=$(getent group reviewers | cut -d: -f3)
+install -d -m 0555 -o root -g root /var/lib/reviewers /var/lib/reviewers/home
+install -d -m 0755 /etc/ssh/authorized_keys
+install -d -m 0711 /srv/review /srv/review/homes /srv/review/originals
+install -d -m 0700 /srv/review/staging /srv/review/manifests
+install -d -m 0755 /etc/brine-review /etc/nginx/brine-users /etc/containers/systemd /etc/nftables.d
+chmod 0700 /etc/nginx/brine-users
+install -d -m 0700 /etc/brine-review/keys
+[[ -f /etc/brine-review/keys/aliases ]] || install -m 0600 /dev/null /etc/brine-review/keys/aliases
+install -m 0644 "$src/review.conf" /etc/brine-review/review.conf
+quotaon -P /srv/review 2>/dev/null || true       # [VERIFY] already on via prjquota
+repquota -P /srv/review >/dev/null || die "project quotas are not active on /srv/review"
+
+step "admin scripts"
+install -d -m 0755 /usr/local/lib/brine-review
+install -m 0644 "$src/lib/common.sh" /usr/local/lib/brine-review/common.sh
+fill "$src/sbin/enter-review" "SHELL_CMD=$shell_cmd" > /usr/local/sbin/enter-review
+chown root:root /usr/local/sbin/enter-review; chmod 0755 /usr/local/sbin/enter-review
+for s in add-reviewer load-applications unload-application activate-reviewer remove-reviewer \
+         install-image setup-data-volume; do
+  install -o root -g root -m 0700 "$src/sbin/$s" "/usr/local/sbin/$s"
+done
+
+step "pi config and container template"
+install -m 0644 "$src/files/models.json" /etc/brine-review/models.json
+jq -e '.providers.brine.apiKey == "injected-by-proxy"' /etc/brine-review/models.json >/dev/null \
+  || die "models.json must hold the dummy key only"
+fill "$src/files/review.container.tmpl" "CTR_MEMORY=$CTR_MEMORY" "CTR_CPUS=$CTR_CPUS" \
+  "CTR_PIDS=$CTR_PIDS" > /etc/brine-review/review.container.tmpl
+chmod 0644 /etc/brine-review/review.container.tmpl
+
+step "nginx (Unix sockets only, no TCP listener)"
+rm -f /etc/nginx/sites-enabled/default
+fill "$src/files/brine-proxy.conf" "BRINE_HOST=$BRINE_HOST" > /etc/nginx/snippets/brine-proxy.conf
+install -m 0644 "$src/files/nginx-brine.conf" /etc/nginx/conf.d/brine.conf
+install -m 0600 "$src/files/nginx-user.conf.tmpl" /etc/brine-review/nginx-user.conf.tmpl
+nginx -t -q
+systemctl enable -q nginx
+systemctl reload-or-restart nginx
+
+step "sudoers"
+tmp=$(mktemp)
+install -m 0440 "$src/files/sudoers-reviewers" "$tmp"
+visudo -cqf "$tmp" || { rm -f "$tmp"; die "sudoers file failed visudo"; }
+mv "$tmp" /etc/sudoers.d/reviewers; chown root:root /etc/sudoers.d/reviewers
+
+step "sshd"
+grep -Eq '^[[:space:]]*Subsystem[[:space:]]+sftp[[:space:]]+/usr/lib/openssh/sftp-server' /etc/ssh/sshd_config \
+  || die "expected 'Subsystem sftp /usr/lib/openssh/sftp-server' in /etc/ssh/sshd_config"
+install -m 0644 "$src/files/sshd-reviewers.conf" /etc/ssh/sshd_config.d/50-reviewers.conf
+sshd -t || die "sshd config test failed; nothing reloaded"
+systemctl try-reload-or-restart ssh      # 24.04 socket-activates sshd; idle means next start reads it
+
+step "nftables: drop all network traffic from the reviewers group"
+fill "$src/files/reviewers.nft" "REVIEWERS_GID=$gid" > /etc/nftables.d/reviewers.nft
+grep -q 'include "/etc/nftables.d/\*.nft"' /etc/nftables.conf \
+  || printf '\ninclude "/etc/nftables.d/*.nft"\n' >> /etc/nftables.conf
+nft -c -f /etc/nftables.conf || die "nftables config check failed"
+systemctl enable -q nftables
+systemctl restart nftables
+nft list table inet reviewer_egress >/dev/null || die "reviewer_egress table missing after restart"
+
+step "fail2ban (after nftables, which flushes the ruleset)"
+fill "$src/files/fail2ban-sshd.local" "ADMIN_CIDRS=$ADMIN_CIDRS" > /etc/fail2ban/jail.d/sshd.local
+systemctl enable -q fail2ban
+systemctl restart fail2ban
+
+if $admin_access; then
+  step "pam_access: admins only from $ADMIN_CIDRS (keep another session open)"
+  grep -Eq '^account[[:space:]]+required[[:space:]]+pam_access\.so' /etc/pam.d/sshd \
+    || printf 'account required pam_access.so\n' >> /etc/pam.d/sshd
+  fill "$src/files/access.conf" "ADMIN_CIDRS=$ADMIN_CIDRS" > /etc/security/access.conf
+  echo "Now open a NEW admin SSH session before closing this one."
+fi
+
+step "checks"
+findmnt /srv/review
+ss -ltnp | grep -q nginx && die "nginx is listening on TCP"
+echo "nginx: no TCP listener"
+fail2ban-client status sshd | head -3
+podman image exists localhost/brine-review:current \
+  && echo "image: localhost/brine-review:current present" \
+  || echo "image: not installed yet (review image <tar>)"
+echo "Done."
