@@ -27,6 +27,11 @@ The Nibi cloud API (`nibi.cloud.sharcnet.ca:5000` and the other service ports) i
 1. Install [Terraform](https://developer.hashicorp.com/terraform/install), [uv](https://docs.astral.sh/uv/), and rsync. Run `uv sync` here to get the OpenStack CLI.
 2. Log in to <https://nibi.cloud.alliancecan.ca> with your CCDB account. Go to *Identity → Application Credentials → Create Application Credential* and download the `clouds.yaml`. Save it as `clouds.yaml` in this folder (or `~/.config/openstack/`), rename its cloud entry from `openstack` to `nibi`, and run `export OS_CLOUD=nibi`. An application credential avoids putting your CCDB password or MFA in the loop.
 3. Put your Brine API key in `./brine.key`.
+4. Check the project's router has a public gateway. New projects normally do, but ours didn't, and without one no VM can get a public IP. `./sandbox` stops with this exact fix if it's missing:
+   ```
+   uv run openstack router list                 # e.g. <project>-router
+   uv run openstack router set --external-gateway public-network <router>
+   ```
 
 That's it for Nibi: the network is auto-detected and the flavor defaults to `p2-4gb`. To override either (e.g. on Arbutus, whose "p" flavors have no root disk, so you need a "c" flavor), copy `sandbox.tfvars.example` to `sandbox.tfvars`. Use `uv run openstack flavor list` etc. to find values.
 

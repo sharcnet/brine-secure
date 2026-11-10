@@ -61,6 +61,16 @@ data "openstack_networking_network_v2" "private" {
   external = false
 }
 
+# Floating IPs NAT through the router on the private network, so it needs a public gateway.
+data "openstack_networking_port_v2" "router" {
+  network_id   = data.openstack_networking_network_v2.private.id
+  device_owner = "network:router_interface"
+}
+
+data "openstack_networking_router_v2" "project" {
+  router_id = data.openstack_networking_port_v2.router.device_id
+}
+
 data "openstack_images_image_v2" "ubuntu" {
   name_regex  = var.image_regex
   most_recent = true
@@ -131,6 +141,13 @@ resource "openstack_compute_instance_v2" "sandbox" {
 
 resource "openstack_networking_floatingip_v2" "sandbox" {
   pool = data.openstack_networking_network_v2.public.name
+
+  lifecycle {
+    precondition {
+      condition     = data.openstack_networking_router_v2.project.external_network_id == data.openstack_networking_network_v2.public.id
+      error_message = "Router '${data.openstack_networking_router_v2.project.name}' has no gateway to '${data.openstack_networking_network_v2.public.name}', so floating IPs can't work. Fix once per project: openstack router set --external-gateway ${data.openstack_networking_network_v2.public.name} ${data.openstack_networking_router_v2.project.name}"
+    }
+  }
 }
 
 resource "openstack_networking_floatingip_associate_v2" "sandbox" {
