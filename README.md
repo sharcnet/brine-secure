@@ -18,19 +18,19 @@ exit            # VM, floating IP, and security groups are all destroyed
 
 Boot runs in two phases. The VM first starts with open egress so cloud-init can install Node and Pi. At that point it holds no secrets and no data. The script then removes that security group, verifies the lock, and only then copies in data and your key.
 
-## One-time setup
+## One-time setup (Nibi cloud)
 
-1. Install [Terraform](https://developer.hashicorp.com/terraform/install), [uv](https://docs.astral.sh/uv/), and rsync.
-2. In the cloud's dashboard ([Arbutus](https://arbutus.alliancecan.ca), [Nibi](https://nibi.cloud.alliancecan.ca)), go to *Identity → Application Credentials*, create one, and download its `clouds.yaml` to `~/.config/openstack/clouds.yaml`. Then `export OS_CLOUD=<name in that file>`.
-3. Run `uv sync` to install the OpenStack CLI, then fill in the cloud-specific names:
-   ```
-   cp sandbox.tfvars.example sandbox.tfvars
-   uv run openstack network list   # private network + external floating-IP pool
-   uv run openstack flavor list
-   ```
-4. Put your Brine API key in `./brine.key`.
+You need membership in a Nibi cloud project. If you don't have one, ask your PI or use the [cloud project request form](https://docs.alliancecan.ca/wiki/Cloud#Getting_a_cloud_project).
 
-The SSH key is generated on first run in `./.ssh/`. `brine.key`, `sandbox.tfvars`, `.ssh/` and the Terraform state are all gitignored.
+The Nibi cloud API (`nibi.cloud.sharcnet.ca:5000` and the other service ports) is IP-allowlisted. The dashboard loads from anywhere, but the CLI and Terraform hang until a sysadmin adds your public IP. Test it with `timeout 5 bash -c '</dev/tcp/nibi.cloud.sharcnet.ca/5000' && echo ok`.
+
+1. Install [Terraform](https://developer.hashicorp.com/terraform/install), [uv](https://docs.astral.sh/uv/), and rsync. Run `uv sync` here to get the OpenStack CLI.
+2. Log in to <https://nibi.cloud.alliancecan.ca> with your CCDB account. Go to *Identity → Application Credentials → Create Application Credential* and download the `clouds.yaml`. Save it as `clouds.yaml` in this folder (or `~/.config/openstack/`), rename its cloud entry from `openstack` to `nibi`, and run `export OS_CLOUD=nibi`. An application credential avoids putting your CCDB password or MFA in the loop.
+3. Put your Brine API key in `./brine.key`.
+
+That's it for Nibi: the network is auto-detected and the flavor defaults to `p2-4gb`. To override either (e.g. on Arbutus, whose "p" flavors have no root disk, so you need a "c" flavor), copy `sandbox.tfvars.example` to `sandbox.tfvars`. Use `uv run openstack flavor list` etc. to find values.
+
+The SSH key is generated on first run in `./.ssh/`. `brine.key`, `sandbox.tfvars`, `.ssh/` and the Terraform state are all gitignored. Your project's `default` security group is left alone; the sandbox makes its own.
 
 ## Use
 
@@ -47,4 +47,5 @@ Set `SSH_FROM_CIDR=x.x.x.x/32` to skip the public-IP lookup (it uses api.ipify.o
 - **No DNS.** Brine is pinned in `/etc/hosts`, and its IP is resolved fresh on each launch. Pi runs with `PI_OFFLINE=1` so it doesn't stall on startup checks.
 - **Work on the VM is lost on exit.** To keep something, copy it out from another terminal with `scp -F .ssh/config agent@sandbox:work/file .`.
 - **Each launch installs Pi from scratch** (a few minutes). A pre-baked image would remove that.
+- **One floating IP per sandbox.** RAS projects get 2 floating IPs, so a project can run at most 2 sandboxes at once (fewer if other VMs hold IPs).
 - **Brine must accept traffic from the cloud's floating-IP range.** If it doesn't, the last setup step fails with a Brine error.

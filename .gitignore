@@ -44,5 +44,6 @@ terraform.rc
 # planout
 # brine-secure: per-user secrets and per-run SSH material
 brine.key
+clouds.yaml
 .ssh/
 .venv/

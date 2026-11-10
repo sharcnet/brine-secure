@@ -1,10 +1,8 @@
-# Copy to sandbox.tfvars (gitignored). Look the values up with the OpenStack CLI:
-#   uv sync
-#   uv run openstack network list            # private network, and the external pool
-#   uv run openstack flavor list
+# Optional. Copy to sandbox.tfvars (gitignored) only to override the defaults.
+#   uv run openstack network list --internal
+#   uv run openstack flavor list --sort-column RAM   # needs Disk > 0
 #   uv run openstack image list | grep -i ubuntu
 
-network          = "def-yourgroup-network"
-floating_ip_pool = "Public-Network"
-flavor           = "p2-3gb"
-# image_regex    = "^Ubuntu-24\\.04"
+# network     = "ctb-brine-tenant-net"  # default: the project's only internal network
+# flavor      = "c2-7.5gb-92"           # default p2-4gb (Nibi). Arbutus "p" flavors have no disk: use a "c" one
+# image_regex = "^Ubuntu-24\\.04"

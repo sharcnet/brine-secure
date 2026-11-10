@@ -17,7 +17,6 @@ fi
 
 command -v terraform >/dev/null || die "terraform not installed"
 [[ -n ${OS_CLOUD:-}${OS_AUTH_URL:-} ]] || die "set OS_CLOUD (clouds.yaml) or source your openrc"
-[[ -f sandbox.tfvars ]] || die "copy sandbox.tfvars.example to sandbox.tfvars and fill it in"
 [[ -s brine.key ]] || die "put your Brine API key in ./brine.key"
 
 mkdir -p .ssh && chmod 700 .ssh
@@ -27,8 +26,10 @@ brine_ip=$(getent ahostsv4 brine.sharcnet.ca | awk 'NR==1 {print $1}')
 [[ -n $brine_ip ]] || die "cannot resolve brine.sharcnet.ca"
 cidr=${SSH_FROM_CIDR:-$(curl -fsS https://api.ipify.org)/32}
 
+varfile=()
+[[ -f sandbox.tfvars ]] && varfile=(-var-file=sandbox.tfvars)
 tf() {
-  terraform "$@" -input=false -auto-approve -var-file=sandbox.tfvars \
+  terraform "$@" -input=false -auto-approve "${varfile[@]}" \
     -var "name=brine-$USER" -var "ssh_public_key=$(cat .ssh/id_ed25519.pub)" \
     -var "ssh_from_cidr=$cidr" -var "brine_ip=$brine_ip"
 }

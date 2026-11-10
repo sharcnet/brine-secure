@@ -17,17 +17,14 @@ variable "name" {
 
 variable "network" {
   type        = string
-  description = "Your project's private network (Horizon: Network > Networks)."
-}
-
-variable "floating_ip_pool" {
-  type        = string
-  description = "External network that floating IPs come from (Horizon: Network > Networks, the 'External' one)."
+  default     = null
+  description = "Private network. Unset: the project's only internal network."
 }
 
 variable "flavor" {
-  type    = string
-  default = "p2-3gb"
+  type        = string
+  default     = "p2-4gb"
+  description = "Must have a root disk (Disk > 0 in 'openstack flavor list'). Arbutus 'p' flavors don't; Nibi's do."
 }
 
 variable "image_regex" {
@@ -54,8 +51,14 @@ variable "bootstrap" {
   description = "true: open egress so cloud-init can install Pi. false: egress limited to Brine."
 }
 
+# Alliance clouds have a single public pool.
+data "openstack_networking_network_v2" "public" {
+  external = true
+}
+
 data "openstack_networking_network_v2" "private" {
-  name = var.network
+  name     = var.network
+  external = false
 }
 
 data "openstack_images_image_v2" "ubuntu" {
@@ -90,7 +93,8 @@ resource "openstack_networking_secgroup_rule_v2" "brine_out" {
   remote_ip_prefix  = "${var.brine_ip}/32"
 }
 
-# Attached only while cloud-init installs Node and Pi. No secrets or data are on the VM yet.
+# Attached only during first boot: cloud-init reads the metadata service and installs Node and Pi.
+# No secrets or data are on the VM yet. The VM must not reboot after lock (metadata is blocked).
 resource "openstack_networking_secgroup_v2" "bootstrap" {
   name                 = "${var.name}-bootstrap"
   delete_default_rules = true
@@ -115,8 +119,6 @@ resource "openstack_compute_instance_v2" "sandbox" {
   name        = var.name
   image_id    = data.openstack_images_image_v2.ubuntu.id
   flavor_name = var.flavor
-  # Config drive, not the metadata service: the locked group gives no route to 169.254.169.254.
-  config_drive = true
   user_data = templatefile("${path.module}/cloud-init.yaml", {
     ssh_public_key = var.ssh_public_key
     brine_ip       = var.brine_ip
@@ -128,7 +130,7 @@ resource "openstack_compute_instance_v2" "sandbox" {
 }
 
 resource "openstack_networking_floatingip_v2" "sandbox" {
-  pool = var.floating_ip_pool
+  pool = data.openstack_networking_network_v2.public.name
 }
 
 resource "openstack_networking_floatingip_associate_v2" "sandbox" {
