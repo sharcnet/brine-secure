@@ -42,3 +42,7 @@ terraform.rc
 # Optional: ignore plan files saved before destroying Terraform configuration
 # Uncomment the line below if you want to ignore planout files.
 # planout
+# brine-secure: per-user secrets and per-run SSH material
+brine.key
+.ssh/
+.venv/

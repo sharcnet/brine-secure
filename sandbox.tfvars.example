@@ -1,0 +1,10 @@
+# Copy to sandbox.tfvars (gitignored). Look the values up with the OpenStack CLI:
+#   uv sync
+#   uv run openstack network list            # private network, and the external pool
+#   uv run openstack flavor list
+#   uv run openstack image list | grep -i ubuntu
+
+network          = "def-yourgroup-network"
+floating_ip_pool = "Public-Network"
+flavor           = "p2-3gb"
+# image_regex    = "^Ubuntu-24\\.04"

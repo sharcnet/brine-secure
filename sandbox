@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Launch a disposable Pi + Brine VM, drop you into it, destroy it when you exit.
+# Usage: ./sandbox [--data DIR]    DIR is copied to /data on the VM, read-only.
+#        ./sandbox --destroy       clean up if a previous run couldn't.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+data="" destroy=false
+if [[ ${1:-} == --destroy ]]; then
+  destroy=true
+elif [[ ${1:-} == --data ]]; then
+  [[ -d ${2:-} ]] || die "--data needs a directory"
+  data=$(realpath "$2")
+fi
+
+command -v terraform >/dev/null || die "terraform not installed"
+[[ -n ${OS_CLOUD:-}${OS_AUTH_URL:-} ]] || die "set OS_CLOUD (clouds.yaml) or source your openrc"
+[[ -f sandbox.tfvars ]] || die "copy sandbox.tfvars.example to sandbox.tfvars and fill it in"
+[[ -s brine.key ]] || die "put your Brine API key in ./brine.key"
+
+mkdir -p .ssh && chmod 700 .ssh
+[[ -f .ssh/id_ed25519 ]] || ssh-keygen -q -t ed25519 -N "" -C brine-sandbox -f .ssh/id_ed25519
+
+brine_ip=$(getent ahostsv4 brine.sharcnet.ca | awk 'NR==1 {print $1}')
+[[ -n $brine_ip ]] || die "cannot resolve brine.sharcnet.ca"
+cidr=${SSH_FROM_CIDR:-$(curl -fsS https://api.ipify.org)/32}
+
+tf() {
+  terraform "$@" -input=false -auto-approve -var-file=sandbox.tfvars \
+    -var "name=brine-$USER" -var "ssh_public_key=$(cat .ssh/id_ed25519.pub)" \
+    -var "ssh_from_cidr=$cidr" -var "brine_ip=$brine_ip"
+}
+
+terraform init -input=false >/dev/null
+if $destroy; then tf destroy; exit; fi
+trap 'echo "Destroying sandbox..."; tf destroy >/dev/null || echo "destroy failed: run ./sandbox --destroy" >&2' EXIT
+
+echo "Creating VM (egress open while Pi installs)..."
+tf apply -var bootstrap=true >/dev/null
+ip=$(terraform output -raw ip)
+
+cat > .ssh/config <<EOF
+Host sandbox
+  HostName $ip
+  IdentityFile $PWD/.ssh/id_ed25519
+  IdentitiesOnly yes
+  UserKnownHostsFile $PWD/.ssh/known_hosts
+  StrictHostKeyChecking accept-new
+  ConnectTimeout 5
+EOF
+rm -f .ssh/known_hosts
+s() { ssh -F .ssh/config "$@"; }
+
+echo "Waiting for $ip..."
+until s ubuntu@sandbox true 2>/dev/null; do sleep 5; done
+s ubuntu@sandbox sudo cloud-init status --wait >/dev/null || die "cloud-init failed: ssh -F .ssh/config ubuntu@sandbox"
+
+echo "Locking egress to Brine only..."
+tf apply -var bootstrap=false >/dev/null
+# Security group changes can take a few seconds to land. curl exit 0 means the internet is reachable.
+locked=false
+for _ in 1 2 3 4 5 6; do
+  rc=$(s agent@sandbox 'curl -s -m 5 -o /dev/null https://1.1.1.1; echo $?') || true
+  if [[ -n $rc && $rc != 0 ]]; then locked=true; break; fi
+  sleep 5
+done
+$locked || die "VM can still reach the internet; refusing to continue"
+
+if [[ -n $data ]]; then
+  echo "Copying $data to /data (read-only)..."
+  rsync -a --chown=root:root --chmod=D555,F444 --rsync-path="sudo rsync" \
+    -e "ssh -F '$PWD/.ssh/config'" "$data/" ubuntu@sandbox:/data/
+  s ubuntu@sandbox 'sudo mount --bind /data /data && sudo mount -o remount,bind,ro /data'
+fi
+
+s agent@sandbox /usr/local/bin/pi-brine-setup.mjs < brine.key
+
+echo "Ready. Run 'pi'. Everything on this VM is destroyed when you exit."
+s -t agent@sandbox 'cd ~/work && exec bash -l' || true
