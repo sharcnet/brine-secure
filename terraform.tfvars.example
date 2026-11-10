@@ -1,4 +1,4 @@
-# Optional. Copy to sandbox.tfvars (gitignored) only to override the defaults.
+# Optional. Copy to terraform.tfvars (gitignored, auto-loaded by Terraform) to override defaults.
 #   uv run openstack network list --internal
 #   uv run openstack flavor list --sort-column RAM   # needs Disk > 0
 #   uv run openstack image list | grep -i ubuntu

@@ -7,7 +7,6 @@ terraform {
   }
 }
 
-# Credentials come from clouds.yaml via $OS_CLOUD (or a sourced openrc).
 provider "openstack" {}
 
 variable "name" {
@@ -51,7 +50,6 @@ variable "bootstrap" {
   description = "true: open egress so cloud-init can install Pi. false: egress limited to Brine."
 }
 
-# Alliance clouds have a single public pool.
 data "openstack_networking_network_v2" "public" {
   external = true
 }
@@ -61,7 +59,6 @@ data "openstack_networking_network_v2" "private" {
   external = false
 }
 
-# Floating IPs NAT through the router on the private network, so it needs a public gateway.
 data "openstack_networking_port_v2" "router" {
   network_id   = data.openstack_networking_network_v2.private.id
   device_owner = "network:router_interface"
@@ -76,10 +73,9 @@ data "openstack_images_image_v2" "ubuntu" {
   most_recent = true
 }
 
-# The sandbox group is the steady state: SSH in from you, HTTPS out to Brine, nothing else.
-# Security groups are enforced by Neutron outside the VM, so root inside can't bypass them.
 resource "openstack_networking_secgroup_v2" "sandbox" {
   name                 = "${var.name}-sandbox"
+  description          = "SSH in from the launching user, HTTPS out to Brine, nothing else"
   delete_default_rules = true
 }
 
@@ -103,10 +99,9 @@ resource "openstack_networking_secgroup_rule_v2" "brine_out" {
   remote_ip_prefix  = "${var.brine_ip}/32"
 }
 
-# Attached only during first boot: cloud-init reads the metadata service and installs Node and Pi.
-# No secrets or data are on the VM yet. The VM must not reboot after lock (metadata is blocked).
 resource "openstack_networking_secgroup_v2" "bootstrap" {
   name                 = "${var.name}-bootstrap"
+  description          = "Open egress for first boot only (metadata, Node, Pi), before any key or data arrives"
   delete_default_rules = true
 }
 

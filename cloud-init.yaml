@@ -1,29 +1,21 @@
 #cloud-config
-# Rendered by Terraform's templatefile(); escape a literal dollar-brace as $${.
-
-# "default" is the image's sudo user (ubuntu). The launch script uses it for setup.
-# "agent" is where you and Pi work. No sudo, so Pi can't touch /data or the system.
 ssh_authorized_keys:
   - ${ssh_public_key}
 users:
   - default
   - name: agent
     shell: /bin/bash
-    lock_passwd: true
     ssh_authorized_keys:
       - ${ssh_public_key}
 
 write_files:
-  # Egress allows no DNS, so pin Brine's name.
   - path: /etc/hosts
     append: true
     content: "${brine_ip} brine.sharcnet.ca\n"
-  # Pi otherwise phones pi.dev at startup, which the network blocks.
   - path: /etc/profile.d/pi.sh
     content: |
       export PI_OFFLINE=1
       export PATH=/opt/node/bin:$PATH
-  # Reads a Brine key on stdin, checks Brine answers, and writes Pi's config.
   - path: /usr/local/bin/pi-brine-setup.mjs
     permissions: "0755"
     content: |
@@ -34,16 +26,15 @@ write_files:
       const baseUrl = "https://brine.sharcnet.ca/v1";
       const res = await fetch(baseUrl + "/models", { headers: { Authorization: "Bearer " + key } });
       if (!res.ok) { console.error("Brine answered " + res.status); process.exit(1); }
-      // Pi only does chat, so skip embedding and transcription models.
-      const ids = (await res.json()).data.map((m) => m.id).filter((id) => !/embed|whisper/i.test(id));
+      const chatModels = (await res.json()).data.map((m) => m.id).filter((id) => !/embed|whisper/i.test(id));
       const preferred = "North-Mini-Code-1.0";
       const dir = homedir() + "/.pi/agent";
       mkdirSync(dir, { recursive: true, mode: 0o700 });
-      const provider = { baseUrl, api: "openai-completions", apiKey: key, models: ids.map((id) => ({ id })) };
+      const provider = { baseUrl, api: "openai-completions", apiKey: key, models: chatModels.map((id) => ({ id })) };
       writeFileSync(dir + "/models.json", JSON.stringify({ providers: { brine: provider } }, null, 2), { mode: 0o600 });
-      const defaultModel = ids.includes(preferred) ? preferred : ids[0];
+      const defaultModel = chatModels.includes(preferred) ? preferred : chatModels[0];
       writeFileSync(dir + "/settings.json", JSON.stringify({ defaultProvider: "brine", defaultModel }, null, 2));
-      console.log("Brine models: " + ids.join(", "));
+      console.log("Brine models: " + chatModels.join(", "));
 
 runcmd:
   - mkdir -p /opt/node /data /home/agent/work

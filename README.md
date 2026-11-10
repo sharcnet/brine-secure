@@ -33,9 +33,9 @@ The Nibi cloud API (`nibi.cloud.sharcnet.ca:5000` and the other service ports) i
    uv run openstack router set --external-gateway public-network <router>
    ```
 
-That's it for Nibi: the network is auto-detected and the flavor defaults to `p2-4gb`. To override either (e.g. on Arbutus, whose "p" flavors have no root disk, so you need a "c" flavor), copy `sandbox.tfvars.example` to `sandbox.tfvars`. Use `uv run openstack flavor list` etc. to find values.
+That's it for Nibi: the network is auto-detected and the flavor defaults to `p2-4gb`. To override either (e.g. on Arbutus, whose "p" flavors have no root disk, so you need a "c" flavor), copy `terraform.tfvars.example` to `terraform.tfvars`, which Terraform loads on its own. Use `uv run openstack flavor list` etc. to find values.
 
-The SSH key is generated on first run in `./.ssh/`. `brine.key`, `sandbox.tfvars`, `.ssh/` and the Terraform state are all gitignored. Your project's `default` security group is left alone; the sandbox makes its own.
+The SSH key is generated on first run in `./.ssh/`. `brine.key`, `clouds.yaml`, `terraform.tfvars`, `.ssh/` and the Terraform state are all gitignored. Your project's `default` security group is left alone; the sandbox makes its own.
 
 ## Use
 
