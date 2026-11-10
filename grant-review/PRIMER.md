@@ -477,8 +477,22 @@ LiteLLM key. `testa2` is there on purpose: its name starts with another reviewer
 catches prefix and glob bugs in socket, home and container paths. Load `sample.pdf` (and a
 `sample.txt`) for each with `review stage` and `review load`, check the manifests, and activate them (§9).
 
-Put the tests in a script (`acceptance.sh`, not written yet) that writes a dated log with the pass/fail result
-and output of every test. Run the whole suite:
+`acceptance.sh` runs the suite from the laptop and writes a dated log to `test-logs/` with
+the result and output of every test: PASS, FAIL, MANUAL (needs a person, often a brine admin;
+the log says what to check) or SKIP. Put the test reviewers' SSH private keys in
+`test-keys/testa`, `test-keys/testb` and `test-keys/testa2` (gitignored). It plants and removes
+the canaries itself.
+
+```bash
+./acceptance.sh                    # everything safe to repeat
+./acceptance.sh --with-resource    # adds 35-37 (fork bomb, memory hog, disk fill)
+./acceptance.sh --with-lifecycle   # adds 52 and 54: revokes testa's key and removes testa
+./acceptance.sh --only 23,24,25    # a subset
+```
+
+Set `PENDING_USER` to a test reviewer who is added but not activated, to cover the last part of
+test 51. Tests 10, 27, 49, 50 and 53 are always MANUAL; 26 is automated on the VM side, with a
+brine-side confirmation. Run the whole suite:
 
 - before go-live
 - after every image rebuild (§9.2)

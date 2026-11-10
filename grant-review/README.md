@@ -28,6 +28,7 @@ Brine's admins must set, and the findings in [`../SECURITY-REVIEW.md`](../SECURI
 
 ```
 review                 admin CLI (laptop); reads review.env
+acceptance.sh          the 56 acceptance tests (laptop); logs to test-logs/
 review.env.example
 terraform/             VM, encrypted data volume, security groups, floating IP
 image/                 container image: Containerfile, lockfile, forwarder, build script
@@ -57,7 +58,8 @@ image/build                         # on the build host (or on the VM now, while
 ./review setup-egress off           # and never on again
 ```
 
-Then run the acceptance tests (PRIMER §11) with three test reviewers before any real one.
+Then add three test reviewers (`testa`, `testb`, `testa2`) with `sample.pdf` and
+`sample.txt`, and run `./acceptance.sh` (PRIMER §11) before any real reviewer.
 
 Per reviewer:
 
@@ -77,4 +79,5 @@ render-tested. Every **[VERIFY]** in PRIMER.md must be checked on the real VM. B
 
 - **Brine:** items 1 and 12 in BRINE-REQUIREMENTS, plus written answers for the rest.
 - **Competition owner:** sign-off under the Tri-agency AI-use guidance.
-- **Not written yet:** `acceptance.sh`, the scripted form of PRIMER §11.
+- **Not run yet:** `acceptance.sh`. Its quoting was dry-run on a Mac, but none of the
+  tests has run against a VM.

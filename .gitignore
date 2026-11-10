@@ -12,3 +12,5 @@ grant-review/review.env
 grant-review/.ssh/
 grant-review/image/brine-review-*.tar*
 grant-review/image/brine-review-*.versions
+grant-review/test-keys/
+grant-review/test-logs/
