@@ -23,6 +23,8 @@ The follow-up pass added two more High findings, 10 and 11. Both are bugs in our
 
 ### 1. Brine's IP serves Plausible Analytics, an internet-readable write channel (High, verified in part)
 
+Tracked in https://github.com/sharcnet/brine-secure/issues/3.
+
 `brine_out` allows TCP 443 to `brine_ip/32`. That IP is a shared reverse proxy. Any `Host` header other than `brine.sharcnet.ca` gets a self-hosted Plausible Analytics instance, the default vhost. Its `/register` page shows a working sign-up form.
 
 Attack: an outsider registers a Plausible account and adds a site. Injected instructions in `/data` make the agent run
@@ -33,7 +35,9 @@ Checked: the vhost behaviour and the open register page, with plain GETs only. I
 
 Fix: Brine needs its own IP, or the proxy must drop any request on that IP whose `Host` or SNI isn't `brine.sharcnet.ca`. Also ask whoever runs Plausible to set `DISABLE_REGISTRATION=invite_only`. Recheck every other vhost on that IP after any change.
 
-### 2. Brine's terms and unknowns block sensitive data (High, policy)
+### 2. Brine's terms and unknowns block sensitive data (High, policy, closed)
+
+Closed 2026-11-10 by the Brine owner: Brine logs only token counts and response times, every model runs on SHARCNET hardware, and no forwarding routes are configured. Brine's terms still say not to send sensitive data, so the owner needs to update them.
 
 The README already says it. Brine's terms say not to send sensitive data, and every file Pi reads goes into a prompt. Before this can change, the Brine owners need to answer:
 
@@ -146,12 +150,12 @@ Test: from a sibling project, run with `--data .` and with `--data some/subdir`,
 
 ## Order of work if this goes ahead
 
-1. Brine owner: a dedicated IP or strict `Host`/SNI filtering for finding 1, plus an answer on where every model runs for finding 2. Logging is answered. Without these, stop.
+1. Brine owner: a dedicated IP or strict `Host`/SNI filtering for finding 1 (issue #3). Without this, stop.
 2. Pre-built image, no bootstrap egress, config drive (3, issue #1). This retires 10 for good.
 3. Per-sandbox scoped keys and a model allowlist (2, 4, issue #2).
 4. A sweeper or shutdown timer (6).
 
-Done: 5, 7, 8, 9, 10 and 11.
+Done: 2, 5, 7, 8, 9, 10 and 11.
 
 ## Method
 
