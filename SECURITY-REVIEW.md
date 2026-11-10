@@ -81,7 +81,9 @@ Anyone with a role in the project can snapshot the running instance with `openst
 
 Fix: use one project per data-access group, and limit members to people cleared for the data. Create the application credential with an expiry, and restricted if the cloud allows it. State this in the README as an explicit assumption.
 
-### 6. No cleanup if the laptop dies (Medium)
+### 6. No cleanup if the laptop dies (Medium, addressed)
+
+Addressed: cloud-init powers the VM off 8 hours after boot. Root on the VM could cancel that, and the disk stays until a destroy.
 
 Teardown is a bash `EXIT` trap. A `kill -9`, power loss, a dead battery, or losing the Nibi API allowlist after an IP change leaves the VM running with the data and key and nobody watching. Even a clean destroy doesn't scrub the disk, because Ceph/RBD deletes aren't wipes.
 
@@ -153,9 +155,7 @@ Test: from a sibling project, run with `--data .` and with `--data some/subdir`,
 1. Brine owner: a dedicated IP or strict `Host`/SNI filtering for finding 1 (issue #3). Without this, stop.
 2. Pre-built image, no bootstrap egress, config drive (3, issue #1). This retires 10 for good.
 3. Per-sandbox scoped keys and a model allowlist (2, 4, issue #2).
-4. A sweeper or shutdown timer (6).
-
-Done: 2, 5, 7, 8, 9, 10 and 11.
+Done: 2, 5, 6, 7, 8, 9, 10 and 11.
 
 ## Method
 

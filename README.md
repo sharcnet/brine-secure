@@ -8,20 +8,37 @@ A disposable VM on an Alliance OpenStack cloud (Arbutus, Nibi) running the [Pi](
 exit            # VM, floating IP, and security groups are all destroyed
 ```
 
-## Requirement: a single-user OpenStack project
+## Security
 
-Run this only in an OpenStack project where you are the only member. Anyone with a role in the project can snapshot the running VM, attach their own security group to it, or open its console, and that gets them your data and your Brine key. The lockdown below assumes nobody else is in the project.
+Run this only in an OpenStack project where you are the only member. Anyone with a role in the project can snapshot the running VM, attach their own security group to it, or open its console, and that gets them your data and your Brine key. Everything below assumes nobody else is in the project. [SECURITY-REVIEW.md](SECURITY-REVIEW.md) has the full review.
 
-## How it's locked down
+### How it's locked down
 
-- **Egress is limited to `brine.sharcnet.ca:443`** by an OpenStack security group. Neutron enforces it outside the VM, so root inside the VM can't get around it. The script checks that the internet is unreachable before it hands over your key or data.
-- **SSH in is allowed only from your current public IP.** Behind campus NAT or eduroam, that IP is shared by everyone on the NAT. Key-only auth still applies, but a VPN range in `SSH_FROM_CIDR` is tighter.
+- **Egress is limited to `brine.sharcnet.ca:443`** by an OpenStack security group. Neutron enforces it outside the VM, so root inside the VM can't get around it.
+- **The lock is checked twice before your key or data go in.** The launcher asks OpenStack that the VM's port has only the sandbox group and that the group's only egress rule is Brine. Then it checks from inside the VM that the internet is unreachable.
+- **Egress never reopens on a used VM.** `./sandbox` refuses to start while a previous sandbox from this folder still exists or wasn't cleaned up. Run `./sandbox --destroy` first. One sandbox per folder at a time.
+- **SSH in is allowed only from your current public IP.**
 - **The first SSH connection is already pinned.** The launcher makes the VM's host key and hands it over in user data, so it knows the fingerprint before it connects.
 - **Pi runs as `agent`, which has no sudo.**
-- **`/data` is read-only.** It's a copy owned by root, bind-mounted with `ro`. Your original files are never touched, and nothing is synced back.
-- **The Brine key never reaches Terraform.** It goes into the VM over SSH after egress is locked, so it isn't in the state file or in cloud-init user data.
+- **`/data` is a read-only copy.** It's owned by root and bind-mounted `ro`. Your original files are never touched, and nothing is synced back.
+- **`--data` can't include this folder**, which holds `clouds.yaml`, `brine.key` and the SSH keys. Relative paths resolve from where you run the command.
+- **The Brine key never reaches Terraform.** It goes into the VM over SSH after the lock, so it isn't in the state file or in cloud-init user data.
+- **Sessions last at most 8 hours.** The VM powers itself off then, in case the launcher died and never cleaned up. A powered-off VM keeps its disk until `./sandbox --destroy`.
+- **Brine stays on SHARCNET.** Every Brine model runs on SHARCNET hardware, no routes forward to outside providers, and Brine logs only token counts and response times.
 
-Boot runs in two phases. The VM first starts with open egress so cloud-init can install Node and Pi. At that point it holds no secrets and no data. The script then removes that security group and verifies the lock twice. It asks OpenStack that the port has only the sandbox group and that the group's only egress rule is Brine, then checks from inside the VM that the internet is unreachable. Only then does it copy in data and your key.
+Boot runs in two phases. The VM first starts with open egress so cloud-init can install Node and Pi. At that point it holds no secrets and no data. The launcher then removes that security group, checks the lock, and only then copies in data and your key.
+
+### What you still need to know
+
+- **Not ready for sensitive data yet.** Brine's IP also serves a Plausible Analytics site with open sign-ups, so a sandbox can post data there ([#3](https://github.com/sharcnet/brine-secure/issues/3)). Brine's terms also still say not to send sensitive data.
+- **Treat `/data` as untrusted.** Text in it can carry instructions that Pi may follow, and Pi loads `AGENTS.md` and `.pi/` from whatever directory it works in. Don't `cd` Pi into `/data`.
+- **`--data` copies everything**, including hidden files like `.git` and `.env`. Pi sends whatever it reads to Brine.
+- **Pi gets your own long-lived Brine key**, and the agent can read it. Per-session keys are [#2](https://github.com/sharcnet/brine-secure/issues/2).
+- **Bootstrap installs Node and Pi from the internet as root**, without pinning every dependency. A pre-built image is [#1](https://github.com/sharcnet/brine-secure/issues/1).
+- **Your public IP may be shared.** Behind campus NAT or eduroam, the SSH rule admits everyone on the NAT. Key-only auth still applies, but a VPN range in `SSH_FROM_CIDR` is tighter.
+- **The public-IP lookup sends your IP to api.ipify.org**, a third party. Setting `SSH_FROM_CIDR` skips it.
+- **Give your application credential an expiry date.** It can do anything in the project.
+- **Cloud operators can read the VM's disks**, and deleting a VM doesn't wipe them.
 
 ## One-time setup (Nibi cloud)
 
@@ -45,11 +62,11 @@ The SSH key is generated on first run in `./.ssh/`. `brine.key`, `clouds.yaml`, 
 ## Use
 
 - `./sandbox`: start a VM, then land in `~/work` as `agent`. Run `pi`.
-- `./sandbox --data DIR`: also copy `DIR` to `/data`, read-only. Everything goes, including hidden files like `.git` and `.env`. `DIR` can't overlap this folder, since it holds your keys.
+- `./sandbox --data DIR`: also copy `DIR` to `/data`, read-only.
 - `ssh -F .ssh/config agent@sandbox`: open a second shell from another terminal.
-- `./sandbox --destroy`: clean up if a run died before it could tear down. Until you do, `./sandbox` refuses to start, so it never reopens egress on a VM that already holds your data. One sandbox per folder at a time.
+- `./sandbox --destroy`: clean up if a run died before it could tear down. `./sandbox` won't start again until you do.
 
-Set `SSH_FROM_CIDR=x.x.x.x/32` to skip the public-IP lookup, for example on a VPN. The lookup sends your IP to api.ipify.org, a third party.
+Set `SSH_FROM_CIDR=x.x.x.x/32` to skip the public-IP lookup, for example on a VPN.
 
 ## Models
 
@@ -65,14 +82,11 @@ Models on Brine, from [brine-examples/model-cards](https://github.com/sharcnet/b
 | `qwen3-embed` | Embedding | 8,192 tokens | Not applicable | No (not chat) |
 | `whisper-large-v3-turbo` | Audio transcription | 25 MB upload | Not applicable | No (not chat) |
 
-Brine's terms say not to submit sensitive data. That applies to anything in `/data`, too: Pi sends whatever it reads to the model.
-
-Treat `/data` as untrusted. Text in it can carry instructions that Pi may follow, and Pi loads `AGENTS.md` and `.pi/` from whatever directory it works in. Don't `cd` Pi into `/data`.
-
 ## Limits
 
 - **No installs after lock.** No PyPI, no apt, no npm. The toolset is what cloud-init installed. If that's too tight, the next step is a mirror route or a baked image.
 - **No DNS.** Brine is pinned in `/etc/hosts`, and its IP is resolved fresh on each launch. Pi runs with `PI_OFFLINE=1` so it doesn't stall on startup checks.
+- **Sessions last at most 8 hours.** See [Security](#security).
 - **Work on the VM is lost on exit.** To keep something, copy it out from another terminal with `scp -F .ssh/config agent@sandbox:work/file .`.
 - **Each launch installs Pi from scratch** (a few minutes). A pre-baked image would remove that.
 - **One floating IP per sandbox.** RAS projects get 2 floating IPs, so a project can run at most 2 sandboxes at once (fewer if other VMs hold IPs).

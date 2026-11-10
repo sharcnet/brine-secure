@@ -40,6 +40,12 @@ write_files:
       writeFileSync(dir + "/settings.json", JSON.stringify({ defaultProvider: "brine", defaultModel }, null, 2));
       console.log("Brine models: " + chatModels.join(", "));
 
+# If the launcher dies and never destroys the VM, don't leave it running with the data.
+power_state:
+  mode: poweroff
+  delay: 480
+  message: Sandbox time limit reached
+
 runcmd:
   - mkdir -p /opt/node /data /home/agent/work
   - curl -fsSL https://nodejs.org/dist/v24.22.2/node-v24.22.2-linux-x64.tar.xz | tar -xJ -C /opt/node --strip-components=1

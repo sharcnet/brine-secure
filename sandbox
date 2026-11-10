@@ -97,5 +97,5 @@ fi
 
 s agent@sandbox /usr/local/bin/pi-brine-setup.mjs < brine.key
 
-echo "Ready. Run 'pi'. Everything on this VM is destroyed when you exit."
+echo "Ready. Run 'pi'. Everything on this VM is destroyed when you exit. It powers off after 8 hours."
 s -t agent@sandbox 'cd ~/work && exec bash -l' || true
