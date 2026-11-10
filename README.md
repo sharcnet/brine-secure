@@ -46,6 +46,22 @@ The SSH key is generated on first run in `./.ssh/`. `brine.key`, `sandbox.tfvars
 
 Set `SSH_FROM_CIDR=x.x.x.x/32` to skip the public-IP lookup (it uses api.ipify.org), for example on a VPN.
 
+## Models
+
+Pi defaults to `North-Mini-Code-1.0`. Switch models inside Pi with `/model`. Each launch reads the live list from Brine's `/v1/models` and registers its chat models with Pi.
+
+Models on Brine, from [brine-examples/model-cards](https://github.com/sharcnet/brine-examples/blob/main/model-cards/README.md):
+
+| Model | Modality | Service limit | Tool calling | In Pi |
+| --- | --- | ---: | --- | --- |
+| `North-Mini-Code-1.0` | Chat | 320,000 tokens | Supported | Default |
+| `Qwen3.8-27B` | Chat, image input | 131,072 tokens | Supported | Yes |
+| `DeepSeek-V4-Flash-0731` | Chat | 131,072 tokens | Supported | Yes |
+| `qwen3-embed` | Embedding | 8,192 tokens | Not applicable | No (not chat) |
+| `whisper-large-v3-turbo` | Audio transcription | 25 MB upload | Not applicable | No (not chat) |
+
+Brine's terms say not to submit sensitive data. That applies to anything in `/data`, too: Pi sends whatever it reads to the model.
+
 ## Limits
 
 - **No installs after lock.** No PyPI, no apt, no npm. The toolset is what cloud-init installed. If that's too tight, the next step is a mirror route or a baked image.
@@ -53,4 +69,4 @@ Set `SSH_FROM_CIDR=x.x.x.x/32` to skip the public-IP lookup (it uses api.ipify.o
 - **Work on the VM is lost on exit.** To keep something, copy it out from another terminal with `scp -F .ssh/config agent@sandbox:work/file .`.
 - **Each launch installs Pi from scratch** (a few minutes). A pre-baked image would remove that.
 - **One floating IP per sandbox.** RAS projects get 2 floating IPs, so a project can run at most 2 sandboxes at once (fewer if other VMs hold IPs).
-- **Brine must accept traffic from the cloud's floating-IP range.** If it doesn't, the last setup step fails with a Brine error.
+- **Brine must accept traffic from the cloud's floating-IP range.** This is confirmed for Nibi cloud. Arbutus is untested. If it fails, the last setup step reports a Brine error.
