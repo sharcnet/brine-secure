@@ -108,3 +108,37 @@ Fix: also check from the control plane that the port's security groups are exact
 2. Pre-built image, no bootstrap egress, config drive (3).
 3. Per-sandbox scoped keys and a model allowlist (2, 4).
 4. A dedicated project and an expiring credential (5), a sweeper (6), host key pinning (7), the control-plane lock check (8).
+
+## Follow-up adversarial review, 2026-11-10
+
+Reviewed commit `547bde6ec4d777decd5582208647f795725a342a` on branch `security/adversarial-review-followup`. The earlier review above is preserved. This pass traced the launcher, Terraform resources, cloud-init and documented data flow. No `AGENTS.md` was present in this checkout or the checked ancestor directories.
+
+Validation used a temporary copy of the actual launcher, dummy credentials and data, and local replacements for Terraform, SSH, name lookup and rsync. No cloud resources were changed, no real credentials were read, and no requests were sent to Brine or an exfiltration destination. Earlier remote observations have not been revalidated. These are two additional findings; the existing blockers still apply.
+
+### 10. Relaunching can reopen internet egress on a VM holding sensitive data — High
+
+Evidence: `sandbox:35-40` always runs `tf apply -var bootstrap=true` against the same working-directory state. `main.tf:114-134` attaches the bootstrap group to the existing port; changing `bootstrap` does not require a fresh instance. That group allows all IPv4 egress at `main.tf:108-112`. The launcher has no check that the state is empty, no forced instance replacement, and no lock covering the whole session.
+
+A prior session can survive an interrupted launcher or failed destroy, as finding 6 describes. If the image, Brine IP and other instance inputs remain unchanged, a subsequent launch can reuse that VM and restore open egress while `/data`, Pi sessions and `models.json` still exist. A process left by prompt injection can wait for the network to reopen and send them out. This bypass needs neither another service on Brine's IP nor an established connection surviving the lock. A second invocation in the same checkout during an active session can cause the same exposure. Terraform's individual operation locks do not protect the interval between applies or the interactive session.
+
+Local validation: the unchanged launcher completed against mocked commands with a prior-session data marker present. The recorded sequence was `init`, `apply bootstrap=true`, `output`, `apply bootstrap=false`, data copy, `destroy`. Nothing inspected or removed the prior data before requesting open egress. Resource reuse follows from the Terraform configuration; an actual Neutron transition and exfiltration were not tested.
+
+Fix: remove bootstrap networking by booting a prepared image under the final security group. Until then, refuse to launch when state contains an existing instance or port, require verified destruction before retrying, and hold a launcher lock from before initialization until teardown finishes. Give each session its own state and instance identity. Never enable bootstrap egress on a previously used VM.
+
+Acceptance check: leave dummy data and a waiting test process in a sandbox, interrupt its launcher, and attempt another launch. It must refuse or use a new VM without loosening the old VM's rules. A simultaneous second invocation must also refuse or use isolated resources. Perform the cloud check only with dummy data and an approved test endpoint.
+
+### 11. Relative `--data` paths can upload the launcher's credentials instead of the intended directory — High
+
+Evidence: `sandbox:6` changes to the script's directory before `sandbox:13-15` validates and resolves `--data`. At `sandbox:69-70`, rsync copies that resolved directory without exclusions. A user in another project running `/path/to/brine-secure/sandbox --data .` therefore uploads the brine-secure directory, rather than their current project. The README puts `clouds.yaml` and `brine.key` in that directory, and the launcher creates its SSH private key there too. Git ignore rules do not exclude any of these from rsync.
+
+The upload makes these files root-owned but mode `0444`, so the agent can read them. This introduces a cloud application credential into the guest, beyond finding 4's expected Brine credential. Any data the agent reads may then go to Brine. If another egress path is available, the stolen cloud credential can also leave the VM and give an attacker the project access described in finding 5. Cloud API access from the locked VM itself was not tested and is not required for the credential disclosure.
+
+Local validation: invoked the temporary launcher from a separate caller directory with `--data .`. The mocked rsync recorded the launcher directory as its source. That directory contained dummy `clouds.yaml`, `brine.key` and `.ssh` files. No real credentials were copied. Absolute paths do not have this resolution bug; other relative paths can select the wrong directory or fail validation.
+
+Fix: resolve and validate the data argument against the original caller directory before changing directories. Reject source directories that include the launcher's credential/state directory, or stage data through an explicit selection process with credential exclusions. Display the resolved source and document that hidden files are included. Path correction alone does not prevent a user from explicitly selecting a credential directory.
+
+Acceptance check: invoke the launcher from a sibling project with `--data .` and with `--data relative/subdirectory`, and verify the source is under the caller's directory. Use dummy credential files to verify that selecting the launcher directory cannot transfer them.
+
+### Effect on release readiness
+
+The project remains unsuitable for sensitive internal data under the existing review's conditions. Finding 10 adds a direct internet-egress failure during reuse or overlapping launches. Fix it before treating the two-phase boot sequence as a confidentiality boundary. Finding 11 can send cloud credentials to the guest through ordinary CLI usage and should be fixed before further data onboarding.
