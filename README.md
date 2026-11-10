@@ -8,15 +8,20 @@ A disposable VM on an Alliance OpenStack cloud (Arbutus, Nibi) running the [Pi](
 exit            # VM, floating IP, and security groups are all destroyed
 ```
 
+## Requirement: a single-user OpenStack project
+
+Run this only in an OpenStack project where you are the only member. Anyone with a role in the project can snapshot the running VM, attach their own security group to it, or open its console, and that gets them your data and your Brine key. The lockdown below assumes nobody else is in the project.
+
 ## How it's locked down
 
 - **Egress is limited to `brine.sharcnet.ca:443`** by an OpenStack security group. Neutron enforces it outside the VM, so root inside the VM can't get around it. The script checks that the internet is unreachable before it hands over your key or data.
-- **SSH in is allowed only from your current public IP.**
+- **SSH in is allowed only from your current public IP.** Behind campus NAT or eduroam, that IP is shared by everyone on the NAT. Key-only auth still applies, but a VPN range in `SSH_FROM_CIDR` is tighter.
+- **The first SSH connection is already pinned.** The launcher makes the VM's host key and hands it over in user data, so it knows the fingerprint before it connects.
 - **Pi runs as `agent`, which has no sudo.**
 - **`/data` is read-only.** It's a copy owned by root, bind-mounted with `ro`. Your original files are never touched, and nothing is synced back.
 - **The Brine key never reaches Terraform.** It goes into the VM over SSH after egress is locked, so it isn't in the state file or in cloud-init user data.
 
-Boot runs in two phases. The VM first starts with open egress so cloud-init can install Node and Pi. At that point it holds no secrets and no data. The script then removes that security group, verifies the lock, and only then copies in data and your key.
+Boot runs in two phases. The VM first starts with open egress so cloud-init can install Node and Pi. At that point it holds no secrets and no data. The script then removes that security group and verifies the lock twice. It asks OpenStack that the port has only the sandbox group and that the group's only egress rule is Brine, then checks from inside the VM that the internet is unreachable. Only then does it copy in data and your key.
 
 ## One-time setup (Nibi cloud)
 
@@ -25,7 +30,7 @@ You need membership in a Nibi cloud project. If you don't have one, ask your PI 
 The Nibi cloud API (`nibi.cloud.sharcnet.ca:5000` and the other service ports) is IP-allowlisted. The dashboard loads from anywhere, but the CLI and Terraform hang until a sysadmin adds your public IP. Test it with `timeout 5 bash -c '</dev/tcp/nibi.cloud.sharcnet.ca/5000' && echo ok`.
 
 1. Install [Terraform](https://developer.hashicorp.com/terraform/install), [uv](https://docs.astral.sh/uv/), and rsync. Run `uv sync` here to get the OpenStack CLI.
-2. Log in to <https://nibi.cloud.alliancecan.ca> with your CCDB account. Go to *Identity → Application Credentials → Create Application Credential* and download the `clouds.yaml`. Save it as `clouds.yaml` in this folder (or `~/.config/openstack/`), rename its cloud entry from `openstack` to `nibi`, and run `export OS_CLOUD=nibi`. An application credential avoids putting your CCDB password or MFA in the loop.
+2. Log in to <https://nibi.cloud.alliancecan.ca> with your CCDB account. Go to *Identity → Application Credentials → Create Application Credential* and download the `clouds.yaml`. Save it as `clouds.yaml` in this folder (or `~/.config/openstack/`), rename its cloud entry from `openstack` to `nibi`, and run `export OS_CLOUD=nibi`. An application credential avoids putting your CCDB password or MFA in the loop. Give it an expiry date, since it can do anything in the project.
 3. Put your Brine API key in `./brine.key`.
 4. Check the project's router has a public gateway. New projects normally do, but ours didn't, and without one no VM can get a public IP. `./sandbox` stops with this exact fix if it's missing:
    ```
@@ -40,11 +45,11 @@ The SSH key is generated on first run in `./.ssh/`. `brine.key`, `clouds.yaml`, 
 ## Use
 
 - `./sandbox`: start a VM, then land in `~/work` as `agent`. Run `pi`.
-- `./sandbox --data DIR`: also copy `DIR` to `/data`, read-only.
+- `./sandbox --data DIR`: also copy `DIR` to `/data`, read-only. Everything goes, including hidden files like `.git` and `.env`. `DIR` can't overlap this folder, since it holds your keys.
 - `ssh -F .ssh/config agent@sandbox`: open a second shell from another terminal.
-- `./sandbox --destroy`: clean up if a run died before it could tear down.
+- `./sandbox --destroy`: clean up if a run died before it could tear down. Until you do, `./sandbox` refuses to start, so it never reopens egress on a VM that already holds your data. One sandbox per folder at a time.
 
-Set `SSH_FROM_CIDR=x.x.x.x/32` to skip the public-IP lookup (it uses api.ipify.org), for example on a VPN.
+Set `SSH_FROM_CIDR=x.x.x.x/32` to skip the public-IP lookup, for example on a VPN. The lookup sends your IP to api.ipify.org, a third party.
 
 ## Models
 
@@ -61,6 +66,8 @@ Models on Brine, from [brine-examples/model-cards](https://github.com/sharcnet/b
 | `whisper-large-v3-turbo` | Audio transcription | 25 MB upload | Not applicable | No (not chat) |
 
 Brine's terms say not to submit sensitive data. That applies to anything in `/data`, too: Pi sends whatever it reads to the model.
+
+Treat `/data` as untrusted. Text in it can carry instructions that Pi may follow, and Pi loads `AGENTS.md` and `.pi/` from whatever directory it works in. Don't `cd` Pi into `/data`.
 
 ## Limits
 

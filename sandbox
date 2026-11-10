@@ -3,7 +3,7 @@
 # Usage: ./sandbox [--data DIR]    DIR is copied to /data on the VM, read-only.
 #        ./sandbox --destroy       clean up if a previous run couldn't.
 set -euo pipefail
-cd "$(dirname "$0")"
+here=$(cd "$(dirname "$0")" && pwd -P)
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -13,7 +13,12 @@ if [[ ${1:-} == --destroy ]]; then
 elif [[ ${1:-} == --data ]]; then
   [[ -d ${2:-} ]] || die "--data needs a directory"
   data=$(realpath "$2")
+  # This folder holds clouds.yaml, brine.key and the SSH key. Never copy it up.
+  if [[ $here/ == "${data%/}/"* || ${data%/}/ == "$here/"* ]]; then
+    die "--data $data overlaps $here, which holds your credentials"
+  fi
 fi
+cd "$here"
 
 command -v terraform >/dev/null || die "terraform not installed"
 [[ -n ${OS_CLOUD:-}${OS_AUTH_URL:-} ]] || die "set OS_CLOUD (clouds.yaml) or source your openrc"
@@ -21,6 +26,10 @@ command -v terraform >/dev/null || die "terraform not installed"
 
 mkdir -p .ssh && chmod 700 .ssh
 [[ -f .ssh/id_ed25519 ]] || ssh-keygen -q -t ed25519 -N "" -C brine-sandbox -f .ssh/id_ed25519
+# The VM's host key. We hand it over in user data, so the first SSH connection is already pinned.
+[[ -f .ssh/host_ed25519 ]] || ssh-keygen -q -t ed25519 -N "" -C brine-sandbox-host -f .ssh/host_ed25519
+export TF_VAR_ssh_host_key=$(cat .ssh/host_ed25519) TF_VAR_ssh_host_public_key=$(cat .ssh/host_ed25519.pub)
+echo "sandbox $(cat .ssh/host_ed25519.pub)" > .ssh/known_hosts
 
 brine_ip=$(getent ahostsv4 brine.sharcnet.ca | awk 'NR==1 {print $1}')
 [[ -n $brine_ip ]] || die "cannot resolve brine.sharcnet.ca"
@@ -33,8 +42,17 @@ tf() {
 }
 
 terraform init -input=false >/dev/null
-if $destroy; then tf destroy; exit; fi
-trap 'echo "Destroying sandbox..."; tf destroy >/dev/null || echo "destroy failed: run ./sandbox --destroy" >&2' EXIT
+if $destroy; then tf destroy; rmdir .sandbox.lock 2>/dev/null || true; exit; fi
+
+# Bootstrap opens egress, so it must only ever run on a brand-new VM. The lock stays
+# behind if a session dies or its destroy fails, until ./sandbox --destroy succeeds.
+mkdir .sandbox.lock 2>/dev/null || die "a sandbox is running from this folder, or one wasn't cleaned up. If none is running: ./sandbox --destroy"
+trap 'rmdir .sandbox.lock' EXIT
+if [[ -f terraform.tfstate ]]; then
+  left=$(terraform state list)
+  [[ -z $left ]] || die "a previous sandbox still exists. Run ./sandbox --destroy first"
+fi
+trap 'echo "Destroying sandbox..."; tf destroy >/dev/null && rmdir .sandbox.lock || echo "destroy failed: run ./sandbox --destroy" >&2' EXIT
 
 echo "Creating VM (egress open while Pi installs)..."
 tf apply -var bootstrap=true >/dev/null
@@ -46,10 +64,10 @@ Host sandbox
   IdentityFile $PWD/.ssh/id_ed25519
   IdentitiesOnly yes
   UserKnownHostsFile $PWD/.ssh/known_hosts
-  StrictHostKeyChecking accept-new
+  HostKeyAlias sandbox
+  StrictHostKeyChecking yes
   ConnectTimeout 5
 EOF
-rm -f .ssh/known_hosts
 s() { ssh -F .ssh/config "$@"; }
 
 echo "Waiting for $ip..."
@@ -58,6 +76,12 @@ s ubuntu@sandbox sudo cloud-init status --wait >/dev/null || die "cloud-init fai
 
 echo "Locking egress to Brine only..."
 tf apply -var bootstrap=false >/dev/null
+# Ask OpenStack, not the VM: the port has only the sandbox group, whose only egress rule is Brine.
+port=$(terraform output -raw port_id) group=$(terraform output -raw sandbox_group_id)
+[[ $(uv run openstack port show "$port" -f value -c security_group_ids) == "['$group']" ]] \
+  || die "sandbox port has extra security groups; refusing to continue"
+[[ $(uv run openstack security group rule list "$group" --egress -f value -c "IP Protocol" -c Ethertype -c "IP Range" -c "Port Range") == "tcp IPv4 $brine_ip/32 443:443" ]] \
+  || die "sandbox group allows more than Brine; refusing to continue"
 tries=0
 until s agent@sandbox '! curl -s -m 5 -o /dev/null https://1.1.1.1'; do
   (( ++tries < 6 )) || die "VM can still reach the internet; refusing to continue"

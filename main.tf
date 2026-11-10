@@ -35,6 +35,16 @@ variable "ssh_public_key" {
   type = string
 }
 
+variable "ssh_host_key" {
+  type        = string
+  sensitive   = true
+  description = "The VM's SSH host private key, so the launcher knows its fingerprint before the first connection."
+}
+
+variable "ssh_host_public_key" {
+  type = string
+}
+
 variable "ssh_from_cidr" {
   type        = string
   description = "Only this range may SSH in."
@@ -125,8 +135,10 @@ resource "openstack_compute_instance_v2" "sandbox" {
   image_id    = data.openstack_images_image_v2.ubuntu.id
   flavor_name = var.flavor
   user_data = templatefile("${path.module}/cloud-init.yaml", {
-    ssh_public_key = var.ssh_public_key
-    brine_ip       = var.brine_ip
+    ssh_public_key      = var.ssh_public_key
+    ssh_host_key        = var.ssh_host_key
+    ssh_host_public_key = var.ssh_host_public_key
+    brine_ip            = var.brine_ip
   })
 
   network {
@@ -153,4 +165,12 @@ resource "openstack_networking_floatingip_associate_v2" "sandbox" {
 
 output "ip" {
   value = openstack_networking_floatingip_v2.sandbox.address
+}
+
+output "port_id" {
+  value = openstack_networking_port_v2.sandbox.id
+}
+
+output "sandbox_group_id" {
+  value = openstack_networking_secgroup_v2.sandbox.id
 }

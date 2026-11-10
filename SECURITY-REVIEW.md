@@ -37,7 +37,7 @@ Fix: Brine needs its own IP, or the proxy must drop any request on that IP whose
 
 The README already says it. Brine's terms say not to send sensitive data, and every file Pi reads goes into a prompt. Before this can change, the Brine owners need to answer:
 
-- Are prompts or responses stored anywhere, and who can read them for how long? Places to check: LiteLLM spend logs with `store_prompts_in_spend_logs`, Langfuse or other callbacks, vLLM request logging, proxy access logs with bodies.
+- Are prompts or responses stored anywhere, and who can read them for how long? Places to check: LiteLLM spend logs with `store_prompts_in_spend_logs`, Langfuse or other callbacks, vLLM request logging, proxy access logs with bodies. Answered 2026-11-10 by the Brine owner: Brine logs only token counts and response times, not prompts or responses.
 - Does any model route off SHARCNET? `explore1.md` flags `gaggle-trial`. `/openapi.json` lists provider pass-through routes `/openai_passthrough/*`, `/anthropic/*`, `/gemini/*`, `/vertex_ai/*`, `/bedrock/*`, `/azure/*` and `/langfuse/*`, plus `/mcp`, `/a2a`, `/v1/files`, `/v1/batches`, vector stores and assistants. LiteLLM lists most routes whether they're configured or not, so the list alone proves nothing. But each route that works with a user key either sends data off-site or stores it somewhere other things can read.
 - Is traffic from Brine to vLLM encrypted, and who administers the workers?
 
@@ -46,6 +46,8 @@ Our code makes this worse. `pi-brine-setup.mjs` registers every chat model that 
 Fix: on our side, hard-code an allowlist of on-prem models. The real control lives on Brine: a key whose `models` list has only on-prem models, with pass-through, files and MCP routes off for that key or team.
 
 ### 3. Bootstrap runs unpinned internet code as root, and that code stays on the VM (High)
+
+Tracked in https://github.com/sharcnet/brine-secure/issues/1.
 
 During bootstrap the VM has open egress and runs, as root:
 
@@ -61,11 +63,15 @@ Fix: use a pre-built image and drop the bootstrap phase. This also fixes 6, 10 a
 
 ### 4. A long-lived personal Brine key sits where the agent can read it (Medium)
 
+Tracked in https://github.com/sharcnet/brine-secure/issues/2.
+
 `./brine.key` is the user's own key. The launcher writes it to `~agent/.pi/agent/models.json`, which the agent can read. Prompt injection can use it against any Brine route the key allows, including finding 2's list, for as long as the key lives. That's well past the VM's lifetime.
 
 Fix: what `explore1.md` already planned. At launch, mint a per-sandbox virtual key with `/key/generate`, limited to on-prem `models`, with a `max_budget` and a `duration` of a few hours. `/key/delete` it in the EXIT trap. That needs a Brine-side key or service account allowed to mint keys, and that key stays on the laptop.
 
-### 5. The OpenStack project is the real trust boundary (Medium)
+### 5. The OpenStack project is the real trust boundary (Medium, addressed)
+
+Addressed: the README now requires a project where the user is the only member, and asks for an application credential with an expiry. Cloud operators can still read the disks.
 
 Anyone with a role in the project can snapshot the running instance with `openstack server image create` and boot the copy with their own security group. That gives them `/data` and the key. They can also attach a group with open egress to the sandbox port, or open the console. The `clouds.yaml` application credential in the repo folder can do all of this too, and by default it's unrestricted and never expires. Cloud operators can always read the disks.
 
@@ -77,19 +83,25 @@ Teardown is a bash `EXIT` trap. A `kill -9`, power loss, a dead battery, or losi
 
 Fix: per-session keys from finding 4 put a time limit on the key. For the VM, run a sweeper in the project that deletes `brine-*` servers older than N hours, or at least add `shutdown -P +<N>` in cloud-init so it stops on its own. For data at rest, ask the Nibi admins whether ephemeral disks are encrypted. If they aren't, someone has to accept that in writing.
 
-### 7. The first SSH connection trusts any host key (Medium-Low)
+### 7. The first SSH connection trusts any host key (Medium-Low, fixed)
+
+Fixed differently from the plan below. The launcher makes the VM's host key, passes it in cloud-init user data, and connects with `StrictHostKeyChecking yes`. Terraform state stores only a hash of user data, so the private key isn't in state.
 
 `rm -f .ssh/known_hosts` plus `StrictHostKeyChecking accept-new` means SSH trusts the first key it sees. Anyone on the path at that moment, on a campus network or hotel wifi, can get `brine.key` and `/data`.
 
 Fix: cloud-init prints the host key fingerprints to the console. Read them with `openstack console log show`, write them to `known_hosts`, and set `StrictHostKeyChecking yes`. That's about 5 lines.
 
-### 8. The lock check runs inside the thing it's checking, and only tests one path (Low)
+### 8. The lock check runs inside the thing it's checking, and only tests one path (Low, fixed)
+
+Fixed: after the lock, the launcher asks OpenStack that the port's only group is the sandbox group and that the group's only egress rule is TCP 443 to Brine.
 
 `curl https://1.1.1.1` runs as `agent` in the VM, so compromised code from finding 3 can make it pass. It also tests only one IP and port. Neutron does the enforcing either way, so this checks our config. It isn't a defence.
 
 Fix: also check from the control plane that the port's only security group is `<name>-sandbox` and that the group's only egress rule is the Brine rule. `openstack port show -c security_group_ids` and `openstack security group rule list` cover both. Keep the curl as a smoke test.
 
-### 9. Smaller things
+### 9. Smaller things (addressed)
+
+The `--data`, prompt injection, NAT and ipify points are now in the README.
 
 - `--data` copies everything, including `.git`, `.env` and credential files. Anything in DIR can go into a prompt. Say so in the README, or add an rsync exclude list. Finding 11 makes this worse.
 - The data can carry its own prompt injection. Pi loads `AGENTS.md` and `.pi/` from the working tree. `/data` isn't the cwd, but if the agent `cd`s into it, those files steer the agent. Findings 1 and 4 are what turn that into real harm.
@@ -97,9 +109,9 @@ Fix: also check from the control plane that the port's only security group is `<
 - `curl api.ipify.org` sends the launcher's IP to a third party. Trivial, but it contradicts "never leaves SHARCNET". Setting `SSH_FROM_CIDR` already avoids it.
 - WIP diff: dropping `lock_passwd: true` changes nothing, because that's cloud-init's default. The new `until` lock loop fails closed if SSH flakes, though its error message is misleading. Both are fine.
 
-### 10. Relaunching can reopen internet egress on a VM that holds the data (High)
+### 10. Relaunching can reopen internet egress on a VM that holds the data (High, fixed)
 
-Added in the follow-up pass.
+Added in the follow-up pass. Fixed: `./sandbox` now takes a `.sandbox.lock` that only a successful destroy removes, and refuses to start if Terraform state still lists resources. The pre-built image is still the real fix.
 
 `sandbox:35-40` always runs `tf apply -var bootstrap=true` against the same state in the repo folder. `main.tf:114-134` attaches the bootstrap group to the existing port, so flipping `bootstrap` doesn't replace the instance. That group allows all IPv4 egress, per `main.tf:108-112`. Nothing in the launcher checks that the state is empty, forces a new instance, or locks for the whole session.
 
@@ -111,9 +123,9 @@ Fix: the pre-built image from finding 3 removes bootstrap egress entirely. Until
 
 Test: leave dummy data and a waiting process in a sandbox, kill its launcher, and launch again. The new launch must refuse or use a new VM, and must not loosen the old VM's rules. A second launch running at the same time must also refuse or use separate resources. Only run the cloud version with dummy data and an approved test endpoint.
 
-### 11. A relative `--data` path uploads the launcher's own credentials (High)
+### 11. A relative `--data` path uploads the launcher's own credentials (High, fixed)
 
-Added in the follow-up pass.
+Added in the follow-up pass. Fixed: `--data` now resolves against the caller's directory, and the launcher refuses any `--data` that overlaps its own folder.
 
 `sandbox:6` changes into the script's directory before `sandbox:13-15` checks and resolves `--data`. Then `sandbox:69-70` rsyncs that directory with no exclusions. So a user who runs `/path/to/brine-secure/sandbox --data .` from their own project uploads brine-secure, not their project. That folder holds `clouds.yaml` and `brine.key`, per the README, and the SSH private key the launcher creates. Rsync ignores `.gitignore`, so all three go up.
 
@@ -134,11 +146,12 @@ Test: from a sibling project, run with `--data .` and with `--data some/subdir`,
 
 ## Order of work if this goes ahead
 
-1. Brine owners: a dedicated IP or strict `Host`/SNI filtering for finding 1, plus written answers on logging and model location for finding 2. Without these, stop.
-2. Ours, now: fix the relative `--data` path (11) and refuse to relaunch over existing state (10). These are small and don't wait on anyone.
-3. Pre-built image, no bootstrap egress, config drive (3). This retires 10 for good.
-4. Per-sandbox scoped keys and a model allowlist (2, 4).
-5. A dedicated project and an expiring credential (5), a sweeper (6), host key pinning (7), the control-plane lock check (8).
+1. Brine owner: a dedicated IP or strict `Host`/SNI filtering for finding 1, plus an answer on where every model runs for finding 2. Logging is answered. Without these, stop.
+2. Pre-built image, no bootstrap egress, config drive (3, issue #1). This retires 10 for good.
+3. Per-sandbox scoped keys and a model allowlist (2, 4, issue #2).
+4. A sweeper or shutdown timer (6).
+
+Done: 5, 7, 8, 9, 10 and 11.
 
 ## Method
 

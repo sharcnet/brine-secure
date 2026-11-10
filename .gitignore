@@ -7,3 +7,4 @@ brine.key
 clouds.yaml
 .ssh/
 .venv/
+.sandbox.lock/
