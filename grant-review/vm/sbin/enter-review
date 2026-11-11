@@ -11,6 +11,11 @@ id -nG "$user" | tr ' ' '\n' | grep -qx reviewers || { echo "denied" >&2; exit 1
 
 ctr="review-$user"
 cmd="${SSH_ORIGINAL_COMMAND:-}"
+# sshd passes a subsystem request as its configured command plus a trailing space
+# ("/usr/lib/openssh/sftp-server "), verified on Ubuntu 24.04's OpenSSH 9.6. Trim surrounding
+# whitespace only; the match below stays exact.
+shopt -s extglob
+cmd="${cmd##+([[:space:]])}"; cmd="${cmd%%+([[:space:]])}"
 term="${TERM:-xterm-256color}"
 [[ "$term" =~ ^[A-Za-z0-9._+-]{1,40}$ ]] || term=xterm-256color
 
@@ -23,8 +28,7 @@ case "$cmd" in
     exec podman exec -it --user reviewer -w /home/reviewer -e TERM="$term" "$ctr" "${SHELL_CMD[@]}"
     ;;
   sftp|internal-sftp|/usr/lib/openssh/sftp-server)
-    # -R: read-only. Reviewers can download, never upload. [VERIFY] with test 28, and what
-    # SSH_ORIGINAL_COMMAND holds for a subsystem request on this OpenSSH version.
+    # -R: read-only. Reviewers can download, never upload (test 28).
     exec podman exec -i --user reviewer -w /home/reviewer "$ctr" /usr/lib/openssh/sftp-server -R
     ;;
   *)

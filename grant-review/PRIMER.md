@@ -383,8 +383,10 @@ is an accepted residual risk. **[VERIFY]** the socket mode once it exists.
   - an interactive shell (or pi only, if `REVIEWER_SHELL=pi`) with `podman exec`, or
   - `sftp-server -R` (read-only).
 
-  It refuses every other remote command, including legacy `scp -O`. **[VERIFY]** what
-  `SSH_ORIGINAL_COMMAND` holds for an sftp subsystem request on this OpenSSH version.
+  It refuses every other remote command, including legacy `scp -O`. For an sftp request,
+  OpenSSH 9.6 sets `SSH_ORIGINAL_COMMAND` to the configured subsystem command **plus a trailing
+  space**, so `enter-review` trims surrounding whitespace before its exact match (found on the
+  local test VM).
 - **pi-only mode** is a usability choice, not a stronger boundary. pi can run shell commands
   from its editor **[VERIFY]**, and extensions are code.
 - **nftables:** `meta skgid <reviewers> drop` on output. This also covers the metadata service.
@@ -658,7 +660,7 @@ fork-bomb and memory-hog processes are gone (log out of `testa` first if needed)
 | 38 | `sudo -l -U testa` | Only `enter-review` |
 | 39 | `stat -c '%U %a %n' /usr/local/sbin/enter-review /usr/local/sbin /usr/local /usr` | All owned by root; none group- or world-writable |
 | 40 | `sudo -u testa sudo -n /usr/local/sbin/enter-review testb` | Refused by sudo (no arguments allowed) |
-| 41 | `ls -ld /run/brine-proxy/*`; `podman inspect review-testa --format '{{range .Mounts}}{{.Source}} {{end}}'` | Each directory is root 0755 and holds only `brine.sock`. testa's container mounts only `/run/brine-proxy/testa`, `/srv/review/homes/testa`, `/srv/review/originals/testa` and `models.json` |
+| 41 | `ls -ld /run/brine-proxy/*`; `podman inspect review-testa --format '{{range .Mounts}}{{.Source}} {{end}}'` | Each directory is root 0755 and holds only `brine.sock`. testa's container mounts only `/run/brine-proxy/testa`, `/run/review-web/testa`, `/srv/review/homes/testa`, `/srv/review/originals/testa` and `models.json` |
 | 42 | `sudo -u testa curl -m5 https://BRINE_HOST`; `sudo -u testa curl -m5 http://169.254.169.254/` | Both fail (nftables drop) |
 | 43 | `curl -s http://169.254.169.254/openstack/latest/user_data`, and the config drive (`blkid -L config-2`, mount read-only, read `openstack/latest/user_data`) | Contains no secrets |
 | 44 | `curl -m5 https://example.com` | Blocked by the security group. `review check` shows only the review group on the port |

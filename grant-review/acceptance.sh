@@ -346,12 +346,12 @@ t32() { local o; o=$(in_ctr testa 'pdftotext ~/originals/sample.pdf ~/sample-out
 nginx_lines() { vm_root 'wc -l < /var/log/nginx/brine-testa.access.log'; }
 
 t33() { local before o paths; before=$(nginx_lines)
-  o=$(in_ctr testa 'timeout 300 pi-review -p "Summarise the main aims in ~/originals/sample.txt in two sentences." 2>&1 | tail -20')
+  o=$(in_ctr testa 'timeout -k 10 300 pi-review -p "Summarise the main aims in ~/originals/sample.txt in two sentences." 2>&1 | tail -20')
   echo "$o"; [[ -n ${o// /} ]] && ! hasE "$o" '(Error|error):'; check $? "pi answers"
   paths=$(vm_root "tail -n +$((before + 1)) /var/log/nginx/brine-testa.access.log | awk '{print \$3}' | sort -u")
   echo "paths: $paths"; ! grep -vxE '/v1/models|/v1/chat/completions' <<<"$paths" | grep -q .; check $? "only the two allowed paths used"; }
 
-t34() { local o; o=$(in_ctr testa 'timeout 300 pi-review -p "Use your bash tool to run: ls /proc/1 && echo BASH_RAN_MARKER. If you have no bash tool, say NO_BASH_TOOL." 2>&1 | tail -20')
+t34() { local o; o=$(in_ctr testa 'timeout -k 10 300 pi-review -p "Use your bash tool to run: ls /proc/1 && echo BASH_RAN_MARKER. If you have no bash tool, say NO_BASH_TOOL." 2>&1 | tail -20')
   echo "$o"; ! has "$o" BASH_RAN_MARKER; check $? "no command ran"
   NOTE="read pi's answer above: it should say it has no bash tool"; }
 
@@ -362,7 +362,8 @@ testb_ok() { in_ctr testb "node -e \"fetch('http://127.0.0.1:4000/v1/models').th
 t35() { $with_resource || return 3; local o
   o=$(in_ctr testa "timeout 30 node -e \"const {spawn}=require('child_process');let n=0;function go(){try{for(let i=0;i<50;i++){spawn(process.execPath,['-e','setTimeout(()=>{},6e5)']).on('error',e=>{console.log('LIMIT',e.code,n);process.exit(0)});n++}}catch(e){console.log('LIMIT',e.code,n);process.exit(0)}setImmediate(go)}go()\"; echo rc=\$?" 2>&1 | tail -5)
   echo "$o"; hasE "$o" 'LIMIT|EAGAIN|Resource temporarily'; check $? "hit the pids limit"
-  vm_root 'podman exec --user reviewer review-testa sh -c "kill -9 -1" 2>/dev/null; true' >/dev/null
+  # Leftover children would keep testa at its process limit and wedge later tests (47).
+  vm_root 'for i in 1 2 3 4 5; do p=$(podman top review-testa hpid args | awk "NR>1 && /setTimeout/ {print \$1}"); [ -z "$p" ] && break; kill -9 $p; sleep 1; done; podman top review-testa hpid args | grep -c setTimeout || true' | sed 's/^/  leftover children: /'
   has "$(testb_ok)" "testb 200"; check $? "testb unaffected"; }
 
 t36() { $with_resource || return 3; local o
@@ -372,7 +373,7 @@ t36() { $with_resource || return 3; local o
   has "$(testb_ok)" "testb 200"; check $? "testb unaffected"; }
 
 t37() { $with_resource || return 3; local o
-  o=$(in_ctr testa "node -e \"const fs=require('fs'),f=fs.openSync(process.env.HOME+'/big','w'),b=Buffer.alloc(1<<26,1);try{for(;;)fs.writeSync(f,b)}catch(e){console.log('STOP',e.code)}\"; rm -f ~/big")
+  o=$(in_ctr testa "node -e \"const fs=require('fs'),f=fs.openSync(process.env.HOME+'/big','w'),b=Buffer.alloc(1<<26,1);try{for(;;)fs.writeSync(f,b)}catch(e){console.log('STOP',e.errno===-122?'EDQUOT':e.code,e.errno)}\"; rm -f ~/big")
   echo "$o"; has "$o" "STOP EDQUOT"; check $? "stopped at the quota"
   has "$(in_ctr testb 'touch ~/x && echo OK; rm -f ~/x')" OK; check $? "testb can still write"; }
 
@@ -391,7 +392,7 @@ t40() { local o rc; o=$(vm_root 'sudo -u testa sudo -n /usr/local/sbin/enter-rev
 t41() { local o; o=$(vm_root 'ls -ld /run/brine-proxy/*; ls -A /run/brine-proxy/testa; podman inspect review-testa --format "{{range .Mounts}}{{.Source}}{{println}}{{end}}" | sort')
   echo "$o"; ! grep '^d' <<<"$o" | grep -vE '^drwxr-xr-x +[0-9]+ root root ' | grep -q .; check $? "socket dirs root 0755"
   hasE "$o" '^brine.sock$'; check $? "testa's dir holds only brine.sock"
-  [[ $(grep '^/' <<<"$o" | sort | tr '\n' ' ') == "/etc/brine-review/models.json /run/brine-proxy/testa /srv/review/homes/testa /srv/review/originals/testa " ]]
+  [[ $(grep '^/' <<<"$o" | sort | tr '\n' ' ') == "/etc/brine-review/models.json /run/brine-proxy/testa /run/review-web/testa /srv/review/homes/testa /srv/review/originals/testa " ]]
   check $? "testa mounts only its own paths"; }
 
 t42() { local o; o=$(vm_root "sudo -u testa curl -s -m5 -o /dev/null -w '%{http_code}' https://$brine_host/; echo; sudo -u testa curl -s -m5 -o /dev/null -w '%{http_code}' http://169.254.169.254/; echo")
@@ -422,9 +423,9 @@ t46() { local o; o=$(vm_root 'find /var/lib/nginx/body /var/lib/nginx/proxy -typ
 # ---------- 11.7 No content logged ----------
 
 t47() { local o
-  o=$(in_ctr testa "timeout 300 pi-review -p 'Repeat exactly: $PROMPT_CANARY' 2>&1 | tail -5"); echo "$o"
+  o=$(in_ctr testa "timeout -k 10 300 pi-review -p 'Repeat exactly: $PROMPT_CANARY' 2>&1 | tail -5"); echo "$o"
   has "$o" "$PROMPT_CANARY"; check $? "pi answered the prompt canary"
-  o=$(in_ctr testa "timeout 300 pi-review -p 'What is the code word in ~/acceptance-file-canary.txt?' 2>&1 | tail -5"); echo "$o"
+  o=$(in_ctr testa "timeout -k 10 300 pi-review -p 'What is the code word in ~/acceptance-file-canary.txt?' 2>&1 | tail -5"); echo "$o"
   has "$o" "$FILE_CANARY"; check $? "pi read the file canary"; }
 
 t48() { local o; o=$(vm_root "grep -rlF -e '$PROMPT_CANARY' -e '$FILE_CANARY' /var/log /var/lib/nginx /etc /srv /root /tmp /var/tmp 2>/dev/null; journalctl --since -2h 2>/dev/null | grep -cF -e '$PROMPT_CANARY' -e '$FILE_CANARY'")
@@ -519,7 +520,7 @@ t59() { web_ready || return 3; local c
   [[ $(c -H 'Content-Type: application/json' -d '{}' "$web/api/apps/sample.pdf/chat/new") == 403 ]]; check $? "write without X-Review refused"
   [[ $(c -H 'X-Review: 1' -d 'message=x' "$web/api/apps/sample.pdf/chat/prompt") == 403 ]]; check $? "form-encoded write refused"
   [[ $(c "$web/api/apps/..%2F..%2Fetc%2Fpasswd/original") == 400 ]]; check $? "encoded traversal refused"
-  [[ $(c --path-as-is "$web/api/apps/../../../etc/passwd") == 404 ]]; check $? "raw traversal refused"
+  [[ $(c --path-as-is "$web/api/apps/../../../etc/passwd") =~ ^40[04]$ ]]; check $? "raw traversal refused"
   [[ $(c "$web/server.js") == 404 && $(c "$web/system-prompt.md") == 404 ]]; check $? "server files not served"
   in_ctr testa 'ln -sfn /etc/passwd ~/work/sample.pdf/notes.md 2>/dev/null; true' >/dev/null
   [[ $(c -X PUT -H 'X-Review: 1' -H 'Content-Type: application/json' -d '{"text":"x"}' "$web/api/apps/sample.pdf/notes") == 400 ]]; check $? "won't write notes through a link"
