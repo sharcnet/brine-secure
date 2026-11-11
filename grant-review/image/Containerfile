@@ -25,6 +25,9 @@ RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
 RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
            /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
  && rm -f /usr/bin/apt /usr/bin/apt-get /usr/bin/apt-cache /usr/bin/dpkg \
+ # openssh-sftp-server depends on openssh-client; sftp-server doesn't need the client tools.
+ && rm -f /usr/bin/ssh /usr/bin/scp /usr/bin/sftp /usr/bin/slogin /usr/bin/ssh-add \
+          /usr/bin/ssh-agent /usr/bin/ssh-keyscan /usr/bin/ssh-copy-id \
  && (userdel -r node 2>/dev/null || true) \
  && useradd -u 1000 -m -s /bin/bash reviewer \
  && useradd -u 1001 -M -s /usr/sbin/nologin fwd \

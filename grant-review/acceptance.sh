@@ -31,22 +31,26 @@ while (( $# )); do
   esac
 done
 
-[[ -r $here/review.env ]] || die "review.env missing"
+envf=${REVIEW_ENV:-$here/review.env}
+[[ -r $envf ]] || die "$envf missing"
 # shellcheck source=/dev/null
-source "$here/review.env"
+source "$envf"
+keys=${TEST_KEYS_DIR:-$here/test-keys}
+logdir=${TEST_LOGS_DIR:-$here/test-logs}
+LOCAL_TEST=${LOCAL_TEST:-0}
 : "${VM_ADMIN:=ubuntu}" "${BRINE_URL:=https://brine.sharcnet.ca}" "${PENDING_USER:=}"
 brine_host=${BRINE_URL#https://}; brine_host=${brine_host%%/*}
 model=${MODELS%% *}
 [[ -n $model ]] || die "MODELS is empty in review.env"
 ip=${VM_HOST:-$(terraform -chdir="$here/terraform" output -raw ip 2>/dev/null)}
 [[ -n $ip ]] || die "no VM address (set VM_HOST or run review apply)"
-kh=$here/.ssh/known_hosts
+kh=${REVIEW_SSH_DIR:-$here/.ssh}/known_hosts
 [[ -s $kh ]] || die "host key not pinned: review pin-hostkey"
-for u in testa testb testa2; do [[ -r $here/test-keys/$u ]] || die "missing test-keys/$u"; done
+for u in testa testb testa2; do [[ -r $keys/$u ]] || die "missing $keys/$u"; done
 
 tmp=$(mktemp -d)
-mkdir -p "$here/test-logs"
-log=$here/test-logs/acceptance-$(date +%Y%m%d-%H%M%S).log
+mkdir -p "$logdir"
+log=$logdir/acceptance-$(date +%Y%m%d-%H%M%S).log
 exec > >(tee -a "$log") 2>&1
 
 R=$(openssl rand -hex 6)
@@ -74,7 +78,7 @@ __CTR_EOF__"
 # ssh as a test reviewer with their key; extra ssh args come first, then the host is added.
 as_rv() {
   local u=$1; shift
-  ssh "${ssh_common[@]}" -o BatchMode=yes -i "$here/test-keys/$u" "$@" "$u@$ip"
+  ssh "${ssh_common[@]}" -o BatchMode=yes -i "$keys/$u" "$@" "$u@$ip"
 }
 
 # A real interactive login (through sshd, ForceCommand and enter-review). Prints only what the
@@ -82,14 +86,14 @@ as_rv() {
 rv_session() {
   local u=$1 cmds=$2; shift 2
   { printf 'PS1=; stty -echo\n'; printf 'echo "__B""EGIN__"\n%s\necho "__E""ND__"\nexit\n' "$cmds"; } \
-    | ssh "${ssh_common[@]}" -o BatchMode=yes -i "$here/test-keys/$u" -tt "$@" "$u@$ip" 2>&1 \
+    | ssh "${ssh_common[@]}" -o BatchMode=yes -i "$keys/$u" -tt "$@" "$u@$ip" 2>&1 \
     | tr -d '\r' | sed -n '/__BEGIN__$/,/__END__$/p' | sed '1d;$d'
 }
 
 sftp_batch() {   # user, batch text; runs in $tmp/dl
   mkdir -p "$tmp/dl"
   ( cd "$tmp/dl" && printf '%s\n' "$2" \
-      | sftp "${ssh_common[@]}" -o BatchMode=yes -i "$here/test-keys/$1" -b - "$1@$ip" 2>&1 )
+      | sftp "${ssh_common[@]}" -o BatchMode=yes -i "$keys/$1" -b - "$1@$ip" 2>&1 )
 }
 
 # ---------- harness ----------
@@ -117,6 +121,8 @@ run() {
   RES_ID+=("$id"); RES_ST+=("$st")
 }
 manual() { echo "  MANUAL: $*"; return 2; }
+# On the local Lima test VM there is no OpenStack, config drive or security group.
+not_local() { [[ $LOCAL_TEST != 1 ]] || { NOTE="not applicable on the local test VM"; return 1; }; }
 
 # ---------- setup and cleanup ----------
 
@@ -186,7 +192,7 @@ t6() { local o; o=$(ssh "${ssh_common[@]}" -o BatchMode=yes -o PubkeyAuthenticat
         -o PreferredAuthentications=password,keyboard-interactive "testa@$ip" true 2>&1)
   echo "$o"; has "$o" "Permission denied (publickey)"; check $? "only publickey offered"; }
 
-t7() { local o rc; o=$(scp -O "${ssh_common[@]}" -o BatchMode=yes -i "$here/test-keys/testa" \
+t7() { local o rc; o=$(scp -O "${ssh_common[@]}" -o BatchMode=yes -i "$keys/testa" \
         "testa@$ip:originals/sample.pdf" "$tmp/legacy.pdf" 2>&1); rc=$?
   echo "rc=$rc $o"; [[ $rc -ne 0 && ! -s $tmp/legacy.pdf ]]; check $? "legacy scp refused"; }
 
@@ -302,9 +308,9 @@ t28() { local o; rm -rf "$tmp/dl"; echo "upload test" > "$tmp/x.txt"
   o=$(vm_root 'ls /srv/review/homes/testa/x.txt /srv/review/originals/testa/x.txt /srv/review/homes/testa/d 2>/dev/null; [ -e /srv/review/originals/testa/sample.pdf ] && echo PDF_STILL_THERE')
   echo "$o"; [[ $o == PDF_STILL_THERE ]]; check $? "uploads, mkdir and rm all refused"
   rm -f "$tmp/scp.pdf"
-  scp "${ssh_common[@]}" -o BatchMode=yes -i "$here/test-keys/testa" "testa@$ip:originals/sample.pdf" "$tmp/scp.pdf" >/dev/null 2>&1
+  scp "${ssh_common[@]}" -o BatchMode=yes -i "$keys/testa" "testa@$ip:originals/sample.pdf" "$tmp/scp.pdf" >/dev/null 2>&1
   [[ -s $tmp/scp.pdf ]]; check $? "scp download works"
-  scp "${ssh_common[@]}" -o BatchMode=yes -i "$here/test-keys/testa" "$tmp/x.txt" "testa@$ip:" >/dev/null 2>&1
+  scp "${ssh_common[@]}" -o BatchMode=yes -i "$keys/testa" "$tmp/x.txt" "testa@$ip:" >/dev/null 2>&1
   [[ -z $(vm_root 'ls /srv/review/homes/testa/x.txt 2>/dev/null') ]]; check $? "scp upload refused"; }
 
 t29() { local o want=${EXPECTED_FILES:-"sample.pdf sample.txt"}
@@ -389,10 +395,10 @@ t41() { local o; o=$(vm_root 'ls -ld /run/brine-proxy/*; ls -A /run/brine-proxy/
 t42() { local o; o=$(vm_root "sudo -u testa curl -s -m5 -o /dev/null -w '%{http_code}' https://$brine_host/; echo; sudo -u testa curl -s -m5 -o /dev/null -w '%{http_code}' http://169.254.169.254/; echo")
   echo "$o"; [[ $(tr -d '\n' <<<"$o") == 000000 ]]; check $? "reviewer account can't reach brine or metadata"; }
 
-t43() { local o; o=$(vm_root 'd=$(mktemp -d); dev=$(blkid -L config-2); mount -o ro "$dev" "$d" && cat "$d/openstack/latest/user_data"; umount "$d"; rmdir "$d"; curl -s -m5 http://169.254.169.254/openstack/latest/user_data')
+t43() { not_local || return 3; local o; o=$(vm_root 'd=$(mktemp -d); dev=$(blkid -L config-2); mount -o ro "$dev" "$d" && cat "$d/openstack/latest/user_data"; umount "$d"; rmdir "$d"; curl -s -m5 http://169.254.169.254/openstack/latest/user_data')
   echo "$o"; [[ -n $o ]] && ! hasE "$o" 'PRIVATE KEY|sk-[A-Za-z0-9]|password|Bearer'; check $? "user data holds no secrets"; }
 
-t44() { local o; o=$(vm_root 'curl -s -m5 -o /dev/null -w "%{http_code}" https://example.com; echo'); echo "example.com: $o"
+t44() { not_local || return 3; local o; o=$(vm_root 'curl -s -m5 -o /dev/null -w "%{http_code}" https://example.com; echo'); echo "example.com: $o"
   [[ $o == 000 ]]; check $? "host can't reach the internet"
   o=$("$here/review" check 2>&1); echo "$o"; has "$o" "port: only"; check $? "only the review group on the port"; }
 
@@ -434,7 +440,7 @@ t51() { local u o
     o=$(rv_session "$u" 'cat ~/.acceptance-whoami; ls ~/originals'); echo "$u: $o"
     [[ $(head -1 <<<"$o") == "$u" ]]; check $? "$u lands in its own container"
   done
-  if [[ -n $PENDING_USER && -r $here/test-keys/$PENDING_USER ]]; then
+  if [[ -n $PENDING_USER && -r $keys/$PENDING_USER ]]; then
     o=$(as_rv "$PENDING_USER" true 2>&1); echo "$PENDING_USER: $o"
     has "$o" "Permission denied"; check $? "not-yet-activated $PENDING_USER refused"
   else NOTE="set PENDING_USER (added, not activated) to test refusal before activation"; fi; }
@@ -466,7 +472,7 @@ t55() { local ipb o; ipb=$(dig +short A "$brine_host" | grep -E '^[0-9.]+$' | he
   echo "$o"; ! grep -qiE 'plausible|<html|register' <<<"$o"; check $? "nothing but brine answers on brine's IP"
   NOTE="until BRINE-REQUIREMENTS item 1 is fixed this fails; record it as the accepted residual risk"; }
 
-t56() { local o; o=$("$here/review" check 2>&1); echo "$o"
+t56() { not_local || return 3; local o; o=$("$here/review" check 2>&1); echo "$o"
   has "$o" "port: only"; check $? "only the review group on the port"
   ! grep -- '->' <<<"$o" | grep -vE ':22 ->|-> [0-9.]+:443$' | grep -q .; check $? "open connections are SSH and :443 only"; }
 

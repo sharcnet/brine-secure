@@ -14,3 +14,9 @@ grant-review/image/brine-review-*.tar*
 grant-review/image/brine-review-*.versions
 grant-review/test-keys/
 grant-review/test-logs/
+grant-review/local/.ssh/
+grant-review/local/review.env
+grant-review/local/test-keys/
+grant-review/local/test-logs/
+grant-review/local/sample.*
+grant-review/local/assignment.csv

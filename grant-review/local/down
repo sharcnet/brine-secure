@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Delete the local grant-review test VM and its data disk (test data only).
+set -euo pipefail
+loc=$(cd "$(dirname "$0")" && pwd -P)
+read -r -p "Delete the grant-review Lima VM and its data disk? Type 'delete': " a
+[[ $a == delete ]] || { echo cancelled; exit 1; }
+limactl stop grant-review 2>/dev/null || true
+limactl delete grant-review 2>/dev/null || true
+limactl disk delete grant-review-data 2>/dev/null || true
+rm -rf "$loc/.ssh" "$loc/review.env" "$loc/assignment.csv"
+echo "Deleted. Test keys and logs are kept in $loc/test-keys and $loc/test-logs."

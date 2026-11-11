@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Admin CLI for the grant-review VM. Runs on an admin's laptop (macOS bash 3.2 is fine).
-# Reads ./review.env (copy review.env.example). Run `review help` for the commands.
+# Reads ./review.env (copy review.env.example), or the file named by $REVIEW_ENV (the local
+# test VM uses local/review.env). Run `review help` for the commands.
 #
 # Secrets never go into command arguments: the LiteLLM admin credential is a header file,
 # and each new reviewer key is held in a shell variable and piped to the VM over SSH.
@@ -12,9 +13,12 @@ confirm() { local a; read -r -p "$1 Type '$2' to continue: " a; [[ $a == "$2" ]]
 valid_user() { [[ ${1:-} =~ ^[a-z][a-z0-9_-]{0,30}$ ]]; }
 valid_file() { [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$ ]]; }
 
-[[ -r $here/review.env ]] || die "copy review.env.example to review.env and fill it in"
+envf=${REVIEW_ENV:-$here/review.env}
+[[ -r $envf ]] || die "copy review.env.example to review.env and fill it in"
 # shellcheck source=/dev/null
-source "$here/review.env"
+source "$envf"
+sshdir=${REVIEW_SSH_DIR:-$here/.ssh}
+local_test=${LOCAL_TEST:-0}   # 1 = the local Lima test VM: no OpenStack, never touch brine keys
 : "${VM_ADMIN:=ubuntu}" "${BRINE_URL:=https://brine.sharcnet.ca}"
 brine_host=${BRINE_URL#https://}; brine_host=${brine_host%%/*}
 
@@ -47,11 +51,14 @@ vm_ip() {
 vm_ssh() {
   local tty=""
   [[ ${1:-} == -t ]] && { tty=-t; shift; }
-  [[ -s $here/.ssh/known_hosts ]] || die "host key not pinned yet: review pin-hostkey"
-  ssh $tty -o HostKeyAlias=review-vm -o UserKnownHostsFile="$here/.ssh/known_hosts" \
+  [[ -s $sshdir/known_hosts ]] || die "host key not pinned yet: review pin-hostkey"
+  ssh $tty -o HostKeyAlias=review-vm -o UserKnownHostsFile="$sshdir/known_hosts" \
       -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes -o ConnectTimeout=10 \
       ${ADMIN_SSH_KEY:+-i "$ADMIN_SSH_KEY"} "$VM_ADMIN@$(vm_ip)" "$@"
 }
+
+# macOS tar would otherwise pack Apple metadata that GNU tar on the VM warns about.
+mac_tar=""; [[ $(uname) == Darwin ]] && mac_tar="--no-xattrs --no-mac-metadata"
 
 # Copy vm/ plus a generated review.conf to /root/brine-review-src on the VM.
 push_src() {
@@ -64,7 +71,7 @@ push_src() {
     printf 'REVIEWER_SHELL=%q\n' "${REVIEWER_SHELL:-bash}"
     printf 'CTR_MEMORY=%q\nCTR_CPUS=%q\nCTR_PIDS=%q\n' "${CTR_MEMORY:-2g}" "${CTR_CPUS:-2}" "${CTR_PIDS:-256}"
   } > "$t/review.conf"
-  COPYFILE_DISABLE=1 tar -C "$t" -cf - . | vm_ssh 'sudo -n rm -rf /root/brine-review-src &&
+  COPYFILE_DISABLE=1 tar $mac_tar -C "$t" -cf - . | vm_ssh 'sudo -n rm -rf /root/brine-review-src &&
     sudo -n install -d -m 0700 /root/brine-review-src &&
     sudo -n tar --no-same-owner -C /root/brine-review-src -xf -' || rc=$?
   rm -rf "$t"
@@ -83,6 +90,10 @@ key_alias_of() {
 }
 
 revoke_alias() {
+  if [[ $local_test == 1 ]]; then echo "LOCAL_TEST: not revoking $1 (test reviewers use your own brine key)"; return 0; fi
+  if [[ -z ${LITELLM_ADMIN_HEADER:-} ]]; then
+    echo "ASK A BRINE ADMIN to revoke the key with alias $1 now (no minting credential here)" >&2; return 1
+  fi
   # [VERIFY] /key/delete accepts key_aliases on brine's LiteLLM version.
   jq -n --arg a "$1" '{key_aliases: [$a]}' | litellm key/delete >/dev/null \
     && echo "revoked LiteLLM key $1" \
@@ -91,13 +102,17 @@ revoke_alias() {
 
 check_lock() {
   local port group sgs
+  if [[ $local_test == 1 ]]; then
+    echo "LOCAL_TEST: no OpenStack security groups to check"
+  else
   port=$(terraform -chdir="$here/terraform" output -raw port_id)
   group=$(terraform -chdir="$here/terraform" output -raw review_group_id)
   sgs=$(os port show "$port" -f json -c security_group_ids | jq -c '.security_group_ids')
   [[ $sgs == "[\"$group\"]" ]] || die "VM port has extra security groups: $sgs"
   echo "port: only $group attached. Its egress rules:"
   os security group rule list "$group" --egress -f value -c "IP Protocol" -c "IP Range" -c "Port Range" | sed 's/^/  /'
-  if [[ -s $here/.ssh/known_hosts ]]; then
+  fi
+  if [[ -s $sshdir/known_hosts ]]; then
     echo "open connections on the VM (expect only SSH and brine :443):"
     vm_ssh 'ss -tnH state established' | awk '{print "  " $3 " -> " $4}'
   else
@@ -113,7 +128,10 @@ review setup-egress on|off          Open egress for first setup only (refused on
 review data-volume <device>         Format and mount the encrypted data volume (once)
 review deploy [--admin-access]      Copy vm/ to the VM and run configure
 review image <tar>                  Install an image made by image/build
-review add <user> <pubkey-file>     Mint a LiteLLM key and create the reviewer (login off)
+review add <user> <pubkey-file> [<keyfile> <gr-alias>]
+                                    Create the reviewer (login off). Mints the key itself if
+                                    LITELLM_ADMIN_HEADER is set; otherwise takes a key a brine
+                                    admin minted (keyfile 0600, plus the alias they gave it)
 review stage <file>...              Copy applications into staging on the encrypted volume
 review load <assignment.csv>        Load staged applications (username,filename lines)
 review manifest <user>              Show a reviewer's manifest for the second-person check
@@ -138,16 +156,16 @@ case $cmd in
     key=$(os console log show "$sid" | tr -d '\r' \
           | sed -n '/BEGIN SSH HOST KEY KEYS/,/END SSH HOST KEY KEYS/p' | grep '^ssh-ed25519 ' | head -1)
     [[ -n $key ]] || die "no ed25519 host key in the console log yet; wait for cloud-init and retry"
-    mkdir -p "$here/.ssh" && chmod 700 "$here/.ssh"
-    printf 'review-vm %s\n' "$(cut -d' ' -f1-2 <<<"$key")" > "$here/.ssh/known_hosts"
-    echo "pinned: $(ssh-keygen -lf "$here/.ssh/known_hosts" | cut -d' ' -f2)"
+    mkdir -p "$sshdir" && chmod 700 "$sshdir"
+    printf 'review-vm %s\n' "$(cut -d' ' -f1-2 <<<"$key")" > "$sshdir/known_hosts"
+    echo "pinned: $(ssh-keygen -lf "$sshdir/known_hosts" | cut -d' ' -f2)"
     echo "Send this fingerprint to reviewers through a separate channel."
     ;;
 
   setup-egress)
     case ${1:-} in
       on)
-        if [[ -s $here/.ssh/known_hosts ]]; then
+        if [[ -s $sshdir/known_hosts ]]; then
           n=$(vm_ssh 'sudo -n find /srv/review/originals /srv/review/staging -type f 2>/dev/null | wc -l') \
             || die "can't check the VM for applications; refusing"
           [[ ${n// /} -eq 0 ]] || die "applications are on the VM; open egress is never allowed again"
@@ -176,8 +194,21 @@ case $cmd in
     vm_ssh "sudo -n /usr/local/sbin/install-image /root/brine-review-image.tar $sum; sudo -n rm -f /root/brine-review-image.tar" ;;
 
   add)
-    u=${1:-} pub=${2:-}
-    valid_user "$u" && [[ -f $pub ]] || die "usage: review add <user> <pubkey-file>"
+    u=${1:-} pub=${2:-} keyfile=${3:-} alias_id=${4:-}
+    valid_user "$u" && [[ -f $pub ]] || die "usage: review add <user> <pubkey-file> [<keyfile> <gr-alias>]"
+    if [[ -n $keyfile ]]; then
+      # Key minted by a brine admin (LiteLLM's team-admin role is an Enterprise feature).
+      [[ -f $keyfile && $alias_id =~ ^gr-[0-9a-f]{8}$ ]] || die "usage: review add <user> <pubkey-file> <keyfile> <gr-xxxxxxxx>"
+      [[ $(stat -f %Lp "$keyfile" 2>/dev/null || stat -c %a "$keyfile") == 600 ]] || die "$keyfile must be mode 0600"
+      vm_ssh "umask 077; cat > /tmp/review-$u.pub" < "$pub"
+      if ! vm_ssh "sudo -n /usr/local/sbin/add-reviewer $u /tmp/review-$u.pub $alias_id" < "$keyfile"; then
+        vm_ssh "rm -f /tmp/review-$u.pub" || true
+        die "add-reviewer failed. Clean up with: review remove $u"
+      fi
+      vm_ssh "rm -f /tmp/review-$u.pub"
+      echo "Now delete $keyfile (rm -P on macOS, shred -u on Linux)."
+      exit 0
+    fi
     for v in LITELLM_TEAM_ID MODELS KEY_DURATION KEY_BUDGET KEY_RPM KEY_TPM; do
       [[ -n ${!v:-} ]] || die "review.env: $v is not set"
     done

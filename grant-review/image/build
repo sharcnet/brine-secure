@@ -10,7 +10,7 @@ here=$(cd "$(dirname "$0")" && pwd -P)
 die() { echo "error: $*" >&2; exit 1; }
 
 command -v podman >/dev/null || die "podman not installed"
-[[ $(uname -m) == x86_64 ]] || die "build on x86_64 (the VM's architecture)"
+[[ $(uname -m) == x86_64 || ${LOCAL_TEST:-0} == 1 ]] || die "build on x86_64 (the VM's architecture)"
 tag=$(date +%Y%m%d)
 [[ ! -e brine-review-$tag.tar ]] || tag=$tag-$(date +%H%M)
 img=localhost/brine-review:$tag

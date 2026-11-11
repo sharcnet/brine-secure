@@ -3,7 +3,9 @@
 #
 # Formats the (encrypted Cinder) data volume with project quotas and mounts it at
 # /srv/review. Refuses any device that already holds a filesystem or partition table, so it
-# can't wipe data. Runs before configure, so it doesn't use common.sh.
+# can't wipe data. The one exception is a volume this script already formatted (label
+# brine-review, already in fstab) that isn't mounted: then it only mounts it. Runs before
+# configure, so it doesn't use common.sh.
 set -euo pipefail
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 die() { echo "error: $*" >&2; exit 1; }
@@ -11,17 +13,34 @@ die() { echo "error: $*" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || die "run as root"
 [[ $# -eq 1 && -b $1 ]] || die "usage: setup-data-volume <block-device>"
 dev=$1
-[[ -z $(blkid -p "$dev" 2>/dev/null) ]] || die "$dev already has a filesystem or partition table; refusing"
-findmnt -rno SOURCE | grep -qx "$dev" && die "$dev is mounted"
 mountpoint -q /srv/review && die "/srv/review is already a mount point"
+findmnt -rno SOURCE | grep -qx "$dev" && die "$dev is mounted"
 
-mkfs.ext4 -q -L brine-review -O quota,project "$dev"     # [VERIFY] project quota feature
-uuid=$(blkid -s UUID -o value "$dev")
+# ext4 project quotas need the quota_v2 module. Ubuntu cloud images run a kernel without
+# linux-modules-extra, so the mount fails with "Failed to enable quota tracking (err=-3)".
+# linux-generic pulls in the extras for every future kernel too, so a kernel update can't
+# leave /srv/review unmountable after a reboot.
+if ! modprobe -q quota_v2; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -q
+  apt-get install -y -q linux-generic "linux-modules-extra-$(uname -r)"
+  modprobe quota_v2 || die "kernel has no quota_v2 module; project quotas can't work"
+fi
+printf 'quota_v2\n' > /etc/modules-load.d/brine-review.conf
+
+uuid=$(blkid -s UUID -o value "$dev" 2>/dev/null || true)
+if [[ -n $uuid && $(blkid -s LABEL -o value "$dev") == brine-review ]] && grep -q "UUID=$uuid /srv/review " /etc/fstab; then
+  echo "$dev was already formatted by this script; mounting only"
+else
+  [[ -z $(blkid -p "$dev" 2>/dev/null) ]] || die "$dev already has a filesystem or partition table; refusing"
+  mkfs.ext4 -q -L brine-review -O quota,project "$dev"
+  uuid=$(blkid -s UUID -o value "$dev")
+  printf 'UUID=%s /srv/review ext4 nodev,nosuid,noexec,prjquota 0 2\n' "$uuid" >> /etc/fstab
+  logger -t brine-review "formatted $dev ($uuid)"
+fi
 install -d -m 0711 /srv/review
-grep -q "UUID=$uuid" /etc/fstab \
-  || printf 'UUID=%s /srv/review ext4 nodev,nosuid,noexec,prjquota 0 2\n' "$uuid" >> /etc/fstab
 systemctl daemon-reload
 mount /srv/review
 chmod 0711 /srv/review
 findmnt /srv/review
-logger -t brine-review "formatted $dev ($uuid) and mounted /srv/review"
+logger -t brine-review "mounted /srv/review from $dev"

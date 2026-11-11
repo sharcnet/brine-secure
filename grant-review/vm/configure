@@ -113,7 +113,8 @@ step "sshd"
 grep -Eq '^[[:space:]]*Subsystem[[:space:]]+sftp[[:space:]]+/usr/lib/openssh/sftp-server' /etc/ssh/sshd_config \
   || die "expected 'Subsystem sftp /usr/lib/openssh/sftp-server' in /etc/ssh/sshd_config"
 install -m 0644 "$src/files/sshd-reviewers.conf" /etc/ssh/sshd_config.d/50-reviewers.conf
-sshd -t || die "sshd config test failed; nothing reloaded"
+# A drop-in that fails the test must not stay behind: the next sshd restart would fail.
+sshd -t || { rm -f /etc/ssh/sshd_config.d/50-reviewers.conf; die "sshd config test failed; drop-in removed, nothing reloaded"; }
 systemctl try-reload-or-restart ssh      # 24.04 socket-activates sshd; idle means next start reads it
 
 step "nftables: drop all network traffic from the reviewers group"
@@ -142,6 +143,7 @@ step "checks"
 findmnt /srv/review
 ss -ltnp | grep -q nginx && die "nginx is listening on TCP"
 echo "nginx: no TCP listener"
+for _ in $(seq 1 20); do fail2ban-client ping >/dev/null 2>&1 && break; sleep 0.5; done
 fail2ban-client status sshd | head -3
 podman image exists localhost/brine-review:current \
   && echo "image: localhost/brine-review:current present" \
