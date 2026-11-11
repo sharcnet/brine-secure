@@ -60,8 +60,12 @@ variable "dns_cidrs" {
 
 variable "mirror_cidrs" {
   type        = list(string)
-  default     = []
-  description = "Package mirror(s) for host updates (TCP 80/443). Empty: updates only in setup windows."
+  description = "Package mirror(s) for host updates (TCP 80/443). Required: once applications are loaded, setup egress is refused, so without a mirror unattended-upgrades fails silently for months."
+
+  validation {
+    condition     = length(var.mirror_cidrs) > 0
+    error_message = "Set mirror_cidrs to the package mirror the VM uses (check /etc/apt/sources.list.d/ubuntu.sources after first boot)."
+  }
 }
 
 variable "ntp_cidrs" {

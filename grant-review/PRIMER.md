@@ -423,10 +423,14 @@ A reviewer's key starts as `/etc/ssh/authorized_keys/<user>.pending`, which sshd
   It never opens an application. `review stage` streams files straight into
   `/srv/review/staging`, so no copy lands on the root disk.
 - **The second-person check:** a second person (from §2) compares `review manifest <user>`
-  with that reviewer's lines in the assignment list. Record who checked and when.
-  `activate-reviewer` re-checks the manifest before switching the login on. Once everyone is
-  loaded and checked, delete the staging copies:
-  `review ssh sudo find /srv/review/staging -type f -delete`.
+  with that reviewer's lines in the assignment list. Record who checked and when. **This is a
+  procedure, not a technical control.** Admins share one account on the VM, and `checked-by`
+  is free text in a log line, so nothing stops one admin loading, "checking" and activating
+  alone. Treat it like any other two-person rule: it works only if people follow it.
+  `activate-reviewer` re-checks the manifest before switching the login on.
+- **Staging is emptied by `load-applications` itself.** Once every copy and manifest is
+  written, it deletes the staged copies it loaded, and the assignment list if it was sent
+  with `review load`. It warns if anything else is left in staging.
 - **`unload-application`:** for a conflict of interest during the review. It removes the file
   and regenerates the manifest. The reviewer's own notes stay; ask the competition owner.
 - **`remove-reviewer --purge-data`** (`review remove`):
