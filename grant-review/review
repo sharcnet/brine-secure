@@ -139,6 +139,7 @@ review activate <user> <checked-by> Switch the reviewer's login on
 review unload <user> <file>         Remove one application (conflict of interest)
 review remove <user>                Remove a reviewer, purge their data, revoke their key
 review revoke <user>                Revoke a reviewer's LiteLLM key only
+review web-password <user>          Set a new random web sign-in password and print it once
 review check                        Control-plane lock check and open connections
 review ssh                          Admin shell on the VM
 EOF
@@ -274,6 +275,13 @@ case $cmd in
     u=${1:-}; valid_user "$u" || die "usage: review revoke <user>"
     alias_id=$(key_alias_of "$u"); [[ -n $alias_id ]] || die "no key alias recorded for $u"
     revoke_alias "$alias_id" ;;
+
+  web-password)
+    valid_user "${1:-}" || die "usage: review web-password <user>"
+    pw=$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)
+    printf '%s\n' "$pw" | vm_ssh "sudo -n /usr/local/sbin/web-password $1" >/dev/null
+    echo "Web password for $1 (shown once; send it through a separate channel): $pw"
+    unset pw ;;
 
   check) check_lock ;;
   ssh)   vm_ssh "$@" ;;

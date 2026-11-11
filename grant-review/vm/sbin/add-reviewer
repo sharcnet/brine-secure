@@ -29,23 +29,19 @@ uid=$(id -u "$u")
 
 install -o root -g root -m 0644 "$pub" "/etc/ssh/authorized_keys/$u.pending"
 
-install -d -m 0700 "$SRV/homes/$u"
+install -d -m 0711 "$SRV/homes/$u"
 chattr +P -p "$uid" "$SRV/homes/$u"             # [VERIFY] project quota on this kernel
 setquota -P "$uid" 0 "$quota_kb" 0 0 "$SRV"
 install -d -o root -g root -m 0555 "$SRV/originals/$u"
 write_manifest "$u"
 
-printf 'd /run/brine-proxy/%s 0755 root root -\n' "$u" > "/etc/tmpfiles.d/brine-proxy-$u.conf"
-chmod 0644 "/etc/tmpfiles.d/brine-proxy-$u.conf"
-systemd-tmpfiles --create "/etc/tmpfiles.d/brine-proxy-$u.conf"
+write_units "$u" >/dev/null
 
 render /etc/brine-review/nginx-user.conf.tmpl "USER=$u" "KEY=$key" > "/etc/nginx/brine-users/$u.conf"
 chmod 0600 "/etc/nginx/brine-users/$u.conf"
 unset key
 nginx -t -q && systemctl reload nginx
 
-render /etc/brine-review/review.container.tmpl "USER=$u" > "/etc/containers/systemd/review-$u.container"
-chmod 0644 "/etc/containers/systemd/review-$u.container"
 systemctl daemon-reload
 systemctl start "review-$u.service"
 

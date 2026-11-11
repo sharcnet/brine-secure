@@ -1,0 +1,30 @@
+#!/bin/bash
+# review-own-home <username>
+#
+# Run by systemd after the reviewer's container starts (ExecStartPost). Gives the reviewer's
+# home and web-socket directory to the container user "reviewer" (uid 1000 inside), using the
+# UID range Podman actually picked for this container (UserNS=auto can pick a different range
+# each start). Podman's own :U option would give them to the container's main user, "fwd".
+#
+# Runs as root on reviewer-controlled files, so it never follows symlinks (chown -h, -P).
+source /usr/local/lib/brine-review/common.sh
+
+[[ $# -eq 1 ]] || die "usage: review-own-home <username>"
+u=$1
+valid_user "$u" || die "bad username: $u"
+map=$(podman inspect "review-$u" --format json | jq -r '.[0].HostConfig.IDMappings | "\(.UidMap[0]) \(.GidMap[0])"')
+read -r umap gmap <<<"$map"
+IFS=: read -r ucs uhost usize <<<"$umap"
+IFS=: read -r gcs ghost gsize <<<"$gmap"
+[[ $ucs == 0 && $gcs == 0 && $uhost =~ ^[0-9]+$ && $ghost =~ ^[0-9]+$ ]] || die "unexpected ID map: $map"
+(( usize > 1000 && gsize > 1000 && uhost > 65535 )) || die "ID map too small or not a user namespace: $map"
+ruid=$(( uhost + 1000 )) rgid=$(( ghost + 1000 ))
+
+chown -R -h -P "$ruid:$rgid" "$SRV/homes/$u"
+chmod 0711 "$SRV/homes/$u"     # traversable: a new UserNS range must reach its mount points
+if [[ -d /run/review-web/$u ]]; then
+  # Leftovers (socket, pid file) belong to the previous UID range; the web app recreates them.
+  find "/run/review-web/$u" -mindepth 1 -maxdepth 1 -delete
+  chown -h "$ruid:$rgid" "/run/review-web/$u"
+  chmod 0711 "/run/review-web/$u"        # nginx (www-data) may reach the socket, not list
+fi

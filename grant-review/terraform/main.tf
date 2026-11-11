@@ -115,7 +115,7 @@ data "openstack_images_image_v2" "ubuntu" {
 
 resource "openstack_networking_secgroup_v2" "review" {
   name                 = "${var.name}-sg"
-  description          = "SSH in from reviewers and admins; out only to brine, DNS and the mirror"
+  description          = "SSH and HTTPS in from reviewers and admins; out only to brine, DNS, NTP and the mirror"
   delete_default_rules = true
 }
 
@@ -127,6 +127,17 @@ resource "openstack_networking_secgroup_rule_v2" "ssh_in" {
   protocol          = "tcp"
   port_range_min    = 22
   port_range_max    = 22
+  remote_ip_prefix  = each.value
+}
+
+resource "openstack_networking_secgroup_rule_v2" "https_in" {
+  for_each          = toset(distinct(concat(var.reviewer_cidrs, var.admin_cidrs)))
+  security_group_id = openstack_networking_secgroup_v2.review.id
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 443
+  port_range_max    = 443
   remote_ip_prefix  = each.value
 }
 

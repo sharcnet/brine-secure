@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Grant review</title>
+<link rel="stylesheet" href="/style.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"></span>
+    <span>Grant review</span>
+  </div>
+  <div class="top-note">Private workspace. Nothing here leaves SHARCNET.</div>
+  <label class="model">Model
+    <select id="model" aria-label="Model"></select>
+  </label>
+</header>
+
+<main class="layout">
+  <nav class="apps" aria-label="Your applications">
+    <h2>Your applications</h2>
+    <ul id="apps"></ul>
+    <p class="empty" id="no-apps" hidden>No applications are assigned to you yet.</p>
+  </nav>
+
+  <section class="doc" aria-label="Document">
+    <div class="doc-bar">
+      <span id="doc-title" class="doc-title">Choose an application</span>
+      <div class="seg" id="doc-mode" hidden>
+        <button id="mode-original" class="seg-btn active">Original</button>
+        <button id="mode-text" class="seg-btn">Text</button>
+      </div>
+      <a id="doc-download" class="btn ghost" hidden>Download original</a>
+    </div>
+    <div id="doc-view" class="doc-view">
+      <div class="placeholder">
+        <p>Pick an application on the left to read it here.</p>
+        <p class="muted">The assistant on the right works on the application you have open.</p>
+      </div>
+    </div>
+  </section>
+
+  <aside class="side" aria-label="Assistant and notes">
+    <div class="tabs" role="tablist">
+      <button role="tab" id="tab-chat" aria-selected="true" class="tab active">Assistant</button>
+      <button role="tab" id="tab-notes" aria-selected="false" class="tab">My notes</button>
+    </div>
+
+    <div id="panel-chat" class="panel">
+      <div class="chat-tools">
+        <button id="new-chat" class="btn ghost" disabled>New conversation</button>
+        <a id="export-chat" class="btn ghost" hidden>Download conversation</a>
+      </div>
+      <div id="messages" class="messages" aria-live="polite">
+        <p class="muted center">Open an application to ask about it.</p>
+      </div>
+      <div id="status" class="status" hidden></div>
+      <form id="ask" class="ask">
+        <textarea id="prompt" rows="3" placeholder="Ask about this application…" disabled></textarea>
+        <div class="ask-row">
+          <span class="hint">Answers are advice. Check them against the original.</span>
+          <button type="button" id="stop" class="btn" hidden>Stop</button>
+          <button type="submit" id="send" class="btn primary" disabled>Ask</button>
+        </div>
+      </form>
+    </div>
+
+    <div id="panel-notes" class="panel" hidden>
+      <div class="chat-tools">
+        <span id="notes-state" class="muted">Notes save automatically.</span>
+        <a id="notes-download" class="btn ghost" hidden>Download notes</a>
+      </div>
+      <textarea id="notes" class="notes" placeholder="Your notes on this application (Markdown is fine)…" disabled></textarea>
+    </div>
+  </aside>
+</main>
+</body>
+</html>

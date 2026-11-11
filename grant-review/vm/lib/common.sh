@@ -50,3 +50,22 @@ write_manifest() {
   fi
   chmod 0600 "$SRV/manifests/$u.sha256"
 }
+
+# Write (or rewrite) a reviewer's runtime units: tmpfiles for the brine and web socket
+# directories, and the Quadlet container unit. Prints "changed" if the container unit changed,
+# so callers know to restart it. The web unit is a template (review-web@.service) and is
+# pulled in by the container unit's Wants=.
+write_units() {
+  local u=$1 unit=/etc/containers/systemd/review-$1.container new
+  printf 'd /run/brine-proxy/%s 0755 root root -\nd /run/review-web/%s 0711 root root -\n' "$u" "$u" \
+    > "/etc/tmpfiles.d/brine-review-$u.conf"
+  chmod 0644 "/etc/tmpfiles.d/brine-review-$u.conf"
+  rm -f "/etc/tmpfiles.d/brine-proxy-$u.conf"           # older name
+  # Only create: tmpfiles would reset /run/review-web/<u> to root, undoing review-own-home.
+  [[ -d /run/brine-proxy/$u && -d /run/review-web/$u ]] || systemd-tmpfiles --create "/etc/tmpfiles.d/brine-review-$u.conf"
+  new=$(render /etc/brine-review/review.container.tmpl "USER=$u")
+  if [[ ! -f $unit || $(< "$unit") != "$new" ]]; then
+    printf '%s\n' "$new" > "$unit"; chmod 0644 "$unit"
+    echo changed
+  fi
+}

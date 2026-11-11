@@ -82,7 +82,7 @@ install -m 0644 "$src/lib/common.sh" /usr/local/lib/brine-review/common.sh
 fill "$src/sbin/enter-review" "SHELL_CMD=$shell_cmd" > /usr/local/sbin/enter-review
 chown root:root /usr/local/sbin/enter-review; chmod 0755 /usr/local/sbin/enter-review
 for s in add-reviewer load-applications unload-application activate-reviewer remove-reviewer \
-         install-image setup-data-volume; do
+         install-image setup-data-volume review-own-home refresh-reviewer web-password; do
   install -o root -g root -m 0700 "$src/sbin/$s" "/usr/local/sbin/$s"
 done
 
@@ -94,10 +94,27 @@ fill "$src/files/review.container.tmpl" "CTR_MEMORY=$CTR_MEMORY" "CTR_CPUS=$CTR_
   "CTR_PIDS=$CTR_PIDS" > /etc/brine-review/review.container.tmpl
 chmod 0644 /etc/brine-review/review.container.tmpl
 
-step "nginx (Unix sockets only, no TCP listener)"
+step "web front door: TLS certificate, password file, web app unit"
+install -d -m 0755 /etc/brine-review/web
+if [[ ! -s /etc/brine-review/web/tls.crt ]]; then
+  # Self-signed until a real certificate replaces tls.crt/tls.key (same paths).
+  san="DNS:$(hostname)"
+  for a in $(hostname -I); do san+=",IP:$a"; done
+  openssl req -x509 -newkey rsa:3072 -nodes -days 825 -subj "/CN=$(hostname)" \
+    -addext "subjectAltName=$san" -keyout /etc/brine-review/web/tls.key \
+    -out /etc/brine-review/web/tls.crt 2>/dev/null
+  chmod 0600 /etc/brine-review/web/tls.key
+  echo "self-signed web certificate for $san"
+fi
+[[ -f /etc/brine-review/web/htpasswd ]] || install -m 0640 -o root -g www-data /dev/null /etc/brine-review/web/htpasswd
+install -m 0644 "$src/files/review-web@.service" /etc/systemd/system/review-web@.service
+systemctl daemon-reload
+
+step "nginx (brine sockets per reviewer; HTTPS :443 for the web app only)"
 rm -f /etc/nginx/sites-enabled/default
 fill "$src/files/brine-proxy.conf" "BRINE_HOST=$BRINE_HOST" > /etc/nginx/snippets/brine-proxy.conf
 install -m 0644 "$src/files/nginx-brine.conf" /etc/nginx/conf.d/brine.conf
+install -m 0644 "$src/files/nginx-web.conf" /etc/nginx/conf.d/review-web.conf
 install -m 0600 "$src/files/nginx-user.conf.tmpl" /etc/brine-review/nginx-user.conf.tmpl
 nginx -t -q
 systemctl enable -q nginx
@@ -141,11 +158,18 @@ fi
 
 step "checks"
 findmnt /srv/review
-ss -ltnp | grep -q nginx && die "nginx is listening on TCP"
-echo "nginx: no TCP listener"
+ports=$(ss -ltnpH | awk '/nginx/ {n=split($4,a,":"); print a[n]}' | sort -u | tr '\n' ' ')
+[[ $ports == "443 " ]] || die "nginx listens on TCP ports other than 443: $ports"
+echo "nginx: TCP 443 only"
 for _ in $(seq 1 20); do fail2ban-client ping >/dev/null 2>&1 && break; sleep 0.5; done
 fail2ban-client status sshd | head -3
 podman image exists localhost/brine-review:current \
   && echo "image: localhost/brine-review:current present" \
   || echo "image: not installed yet (review image <tar>)"
+step "existing reviewers: rewrite units from the current templates"
+if podman image exists localhost/brine-review:current; then
+  /usr/local/sbin/refresh-reviewer --all
+else
+  echo "no image yet; skipped"
+fi
 echo "Done."

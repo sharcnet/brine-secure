@@ -1,13 +1,15 @@
 # grant-review
 
 A second deployment of Pi + Brine, for confidential grant review. About 50 reviewers share one
-long-lived VM. Each reviewer SSHes into their own container, which has no network at all.
-The only way out is a Unix socket to nginx on the host. nginx adds that reviewer's Brine key
+long-lived VM, each with their own Podman container that has no network at all. Reviewers
+sign in to a **web page** (their applications, the original or its text, an assistant panel,
+and their notes), or use SSH and a terminal if they prefer. Both land in their own container.
+The only way out is a Unix socket to nginx on the host, which adds that reviewer's Brine key
 and forwards two exact API paths to Brine. Admins pre-load each reviewer's assigned
 applications as read-only files. Reviewers can download but never upload.
 
 [PRIMER.md](PRIMER.md) is the design: what each piece does and why, what still needs
-verifying, the 56 acceptance tests, and operations. Start there. A security sign-off write-up
+verifying, the 61 acceptance tests, and operations. Start there. A security sign-off write-up
 with a diagram and threat model exists as a separate document (ask the grant-review admins).
 
 ## How it differs from the sandbox
@@ -28,10 +30,12 @@ Brine's admins must set, and the findings in [`../SECURITY-REVIEW.md`](../SECURI
 
 ```
 review                 admin CLI (laptop); reads review.env
-acceptance.sh          the 56 acceptance tests (laptop); logs to test-logs/
+acceptance.sh          the 61 acceptance tests (laptop); logs to test-logs/
 review.env.example
 terraform/             VM, encrypted data volume, security groups, floating IP
 image/                 container image: Containerfile, lockfile, forwarder, build script
+image/web/             the reviewers' web app (Node built-ins only), served from inside each container
+local/                 a Lima test VM for a Mac: local/up builds everything, see local/README.md
 vm/configure           sets up the VM (run by `review deploy`)
 vm/sbin/               enter-review and the admin scripts
 vm/lib/common.sh       shared helpers for the admin scripts
@@ -69,6 +73,7 @@ Per reviewer:
 ./review load assignment.csv        # username,filename
 ./review manifest alice             # a second person checks this against the list
 ./review activate alice "J. Smith"
+./review web-password alice         # prints a new web sign-in password once
 ./review remove alice               # purge data, revoke key (asks you to type the name)
 ```
 

@@ -32,6 +32,9 @@ How it differs from OpenStack:
 **Expected results locally:**
 
 - **SKIP:** tests 43, 44 and 56. They check OpenStack-only things.
+- **Web:** open `https://192.168.64.2/` (the address `up` prints), accept the self-signed
+  certificate, and sign in as `testa`, `testb` or `testa2`. The passwords are in
+  `local/web-passwords.txt` (gitignored).
 - **Checked by hand:** tests 45 and 46 note that volume encryption and snapshots must be
   checked by hand.
 - **FAIL:** test 55 fails until brine stops serving another site on its IP

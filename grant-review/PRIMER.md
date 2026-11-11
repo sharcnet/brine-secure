@@ -17,7 +17,7 @@ what to verify, and holds the acceptance tests.
 > - New controls: per-reviewer disk quotas, a size-limited `/tmp`, fail2ban, MaxAuthTries 3,
 >   `DisableForwarding`, and admin SSH limited to allowlisted addresses (pam_access).
 > - A list of the settings brine needs, now shared as `../BRINE-REQUIREMENTS.md`.
-> - §11 grew from 22 to 56 tests, including a canary test for content logging.
+> - §11 grew from 22 to 61 tests, including a canary test for content logging.
 >
 > **Revision 2026-11-10b:** moved into `sharcnet/brine-secure` as a second deployment. The
 > inline code became real files (`review`, `terraform/`, `image/`, `vm/`). Findings from
@@ -30,6 +30,11 @@ what to verify, and holds the acceptance tests.
 > - the host key is pinned from the console log
 > - the OpenStack project is the trust boundary
 > - brine's terms
+>
+> **Revision 2026-11-11:** a web front end (§8.1), so reviewers can work from a browser
+> instead of SSH and a terminal. It runs inside each reviewer's no-network container, behind
+> nginx HTTPS sign-in on the host. A local Lima test VM (`local/`) found and fixed several
+> bugs, including reviewers being unable to write their own home (§8.2).
 >
 > The security sign-off document is https://claude.ai/artifact/4eesUymPrNMEbpVyeMMxi7.
 
@@ -67,7 +72,8 @@ what to verify, and holds the acceptance tests.
 
 About 50 grant reviewers each get an isolated container on a single OpenStack VM. Inside it
 they use the **pi** coding agent with open-weight models served by **brine** (a LiteLLM,
-OpenAI-compatible endpoint) to analyse confidential applications. Admins load each reviewer's
+OpenAI-compatible endpoint) to analyse confidential applications. Most reviewers work from a
+**web page** (§8.1); SSH and a terminal are there for admins and anyone who prefers them. Admins load each reviewer's
 assigned applications before the reviewer gets access.
 
 ### Required properties
@@ -76,7 +82,8 @@ assigned applications before the reviewer gets access.
 2. **pi can do local file operations and call brine, nothing else.**
 3. **Reviewers are isolated from each other.** No shared files, processes or network, and no
    shared UID range.
-4. **Reviewers never get a host shell.** SSH always lands in their own container.
+4. **Reviewers never get a host shell.** SSH always lands in their own container, and the web
+   page is served from inside their own container.
 5. **Minimal tooling** in the container: no compilers, curl/wget, git, python, ssh client,
    package installs or sudo.
 6. **Reviewers never see the brine API key.** nginx adds it outside the container, and each
@@ -386,6 +393,76 @@ is an accepted residual risk. **[VERIFY]** the socket mode once it exists.
 A reviewer's key starts as `/etc/ssh/authorized_keys/<user>.pending`, which sshd ignores.
 `activate-reviewer` renames it.
 
+### 8.1 Web front end (HTTPS)
+
+Most reviewers will never use SSH. They sign in at `https://<VM>/` and get a three-panel page:
+- **left:** their applications
+- **middle:** the original (the browser's PDF viewer) or its extracted text
+- **right:** an assistant panel, plus their notes for that application
+
+Notes and conversations download as Markdown.
+
+```
+browser ──HTTPS──► VM: nginx :443 ── sign-in (basic auth now; SSO later, see below)
+                        │ $remote_user → /run/review-web/<user>/web.sock   (only that one)
+                        ▼
+                  container review-<user> (network=none):
+                    node /opt/review-web/server.js  (as "reviewer", Unix socket only)
+                      └─ pi --mode rpc, one per application, tools read,grep,find,ls,write,edit
+                           └─ 127.0.0.1:4000 → brine socket → nginx adds the key → brine
+```
+
+- **No new way out:**
+  - The web app runs inside the reviewer's existing container, as `reviewer`, and listens only
+    on a Unix socket in `/run/review-web/<user>/`, bind-mounted into that container alone.
+  - It reaches brine through the same forwarder as SSH sessions.
+  - `review-web@<user>.service` starts it with `podman exec` once the container is up.
+- **Sign-in and routing:**
+  - nginx (`vm/files/nginx-web.conf`) serves TLS on 443 and checks the password against
+    `/etc/brine-review/web/htpasswd`, set with `review web-password <user>`.
+  - It picks the socket only from the verified user name: a non-name maps to a path that
+    can't exist.
+  - It strips the `Authorization` header, so the password never reaches the container.
+  - The access log records user, method, status and size, but no URLs, because paths carry
+    application file names.
+  - fail2ban watches failed sign-ins.
+- **Driving pi safely:**
+  - The server builds every RPC command itself from a fixed list: prompt, abort, new session,
+    set model, get messages.
+  - pi's RPC protocol also has a `bash` command that ignores `--tools`. The server never sends
+    it, and nothing from the browser reaches pi except the text of a question.
+  - Each application gets its own pi session in `~/work/<application>/.sessions`.
+  - The system prompt (`image/web/system-prompt.md`) tells pi that the application is data,
+    not instructions, and never to write links or images.
+- **Browser-side defences:**
+  - A strict CSP: `default-src 'none'`, scripts, styles and fetches only from the page itself.
+    That means no request can go to another site, even if an answer contained one.
+  - Every element is built with `textContent`, and a small safe Markdown subset is rendered by
+    hand. Links stay plain text and images never load.
+  - Writes need a custom header and JSON, and cross-site requests are refused
+    (`Sec-Fetch-Site`).
+  - Application names must match the loader's strict pattern.
+  - Notes are never written through a symlink.
+- **Not in the web page:** uploads, sharing, a shell, other users' anything.
+- **SSO for production [OPEN]:** basic auth with per-reviewer random passwords is fine for a
+  pilot. For the competition, put the institution's sign-on in front, e.g. oauth2-proxy with
+  `auth_request` to the identity provider, and map the signed-in identity to the reviewer name
+  in `$review_sock`'s `map`. Everything behind that line stays the same.
+- **Certificate:** `configure` makes a self-signed certificate if none exists. Replace
+  `/etc/brine-review/web/tls.crt` and `tls.key` with a real one (same paths).
+
+### 8.2 Who owns the home folder
+
+Podman's `:U` volume option gives a volume to the container's *main* user, which here is
+`fwd`, the forwarder. With `:U` on the home, reviewers couldn't read or write their own home:
+pi couldn't save sessions, pdftotext couldn't read, and sftp failed. The local test VM caught
+this. Instead:
+- **Before each start:** `ExecStartPre` sets the home to 0711, so the container runtime can
+  set up mounts inside it in whatever UID range `UserNS=auto` picks.
+- **After each start:** `review-own-home` reads the range Podman actually picked and gives the
+  home, and the web socket folder, to `reviewer`. It uses `chown -R -h -P`, so as root it never
+  follows a link the reviewer made.
+
 ---
 
 ## 9. Phase 6: reviewers and applications
@@ -614,6 +691,18 @@ This is the evidence for the Tri-agency sign-off (§12), so don't skip it.
 |---|---|---|
 | 55 | On the host as admin (not a reviewer): `curl -sk -m5 -H 'Host: anything' https://<brine IP>/` and `curl -sk -m5 --resolve x.example:443:<brine IP> https://x.example/` | No response from any site other than brine (BRINE-REQUIREMENTS item 1). Until that's fixed, record it as a residual risk: only a compromised host process could use it, since containers have no network and nginx always sends brine's name |
 | 56 | `review check` after setup egress is turned off, and again after a reboot | Only the review group on the port; open connections are SSH and brine :443 only |
+
+### 11.10 Web front end
+
+Set `WEB_PASSWORDS_FILE` to a file of `<user> <password>` lines for the test reviewers.
+
+| # | Test | Expected |
+|---|---|---|
+| 57 | `https://VM/` with no password, with a wrong password, and `http://VM/` | 401 with a sign-in prompt; 401; no plain-HTTP listener |
+| 58 | Each test reviewer lists `/api/apps`; `nginx -T` | Each sees only their own applications; the socket comes only from the verified name; `Authorization` is stripped |
+| 59 | Cross-site read; a write without `X-Review`; a form-encoded write; `..%2F` and raw `../` paths; `/server.js`; notes replaced by a symlink to `/etc/passwd`, then saved | 403, 403, 403, 400, 404, 404; the save is refused (400) |
+| 60 | Response headers; `review-web.access.log`; `/var/lib/nginx` | `default-src 'none'` CSP and HSTS; no URLs or file names in the log; no temp files |
+| 61 | Over the web, ask pi to run `cat /etc/passwd` with a shell and to give a link | It completes with only file tools; no shell tool, no passwd contents; read the answer: no link |
 
 Then remove the remaining test reviewers with `--purge-data`, revoke their keys, and delete the
 canary files.

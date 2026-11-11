@@ -49,6 +49,7 @@ REVIEW_SSH_DIR=$loc/.ssh
 TEST_KEYS_DIR=$loc/test-keys
 TEST_LOGS_DIR=$loc/test-logs
 PENDING_USER=testp
+WEB_PASSWORDS_FILE=$loc/web-passwords.txt
 BRINE_URL=https://brine.sharcnet.ca
 MODELS="North-Mini-Code-1.0"
 ADMIN_CIDRS="$subnet"
@@ -73,13 +74,16 @@ fi
 step "configure"
 rv deploy
 
-step "container image (built inside the VM before any test data, as on first setup)"
-if rv ssh 'sudo -n podman image exists localhost/brine-review:current'; then echo "already installed"
+step "container image (built inside the VM, as on first setup; rebuilt when image/ changes)"
+img_sum=$(cd "$gr/image" && find . -type f ! -name '.*' -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16)
+if [[ $(rv ssh 'sudo -n cat /root/image-src.sum 2>/dev/null') == "$img_sum" ]] && rv ssh 'sudo -n podman image exists localhost/brine-review:current'; then
+  echo "image up to date ($img_sum)"
 else
   COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C "$gr/image" -cf - . | rv ssh 'sudo -n rm -rf /root/image-src && sudo -n install -d -m 0700 /root/image-src && sudo -n tar --no-same-owner -C /root/image-src -xf -'
-  rv ssh "sudo -n sh -c 'cd /root && LOCAL_TEST=1 bash /root/image-src/build'"
+  rv ssh "sudo -n sh -c 'cd /root && rm -f brine-review-*.tar* && LOCAL_TEST=1 bash /root/image-src/build'"
   tar=$(rv ssh 'sudo -n sh -c "ls -t /root/brine-review-*.tar | head -1"')
-  rv ssh "sudo -n /usr/local/sbin/install-image $tar \$(sudo -n cat $tar.sha256)"
+  rv ssh "sudo -n /usr/local/sbin/install-image $tar \$(sudo -n cat $tar.sha256) && echo $img_sum | sudo -n tee /root/image-src.sum >/dev/null"
+  rv ssh "sudo -n systemctl restart 'review-*.service'" || true
 fi
 
 step "test reviewers"
@@ -112,7 +116,20 @@ for u in testa testb testa2; do
   rv activate "$u" "local test"
 done
 
+step "web sign-in passwords for the active test reviewers"
+pwf=$loc/web-passwords.txt
+touch "$pwf"; chmod 600 "$pwf"
+for u in testa testb testa2; do
+  grep -q "^$u " "$pwf" && rv ssh "sudo -n grep -q '^$u:' /etc/brine-review/web/htpasswd" && continue
+  pw=$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)
+  printf '%s\n' "$pw" | rv ssh "sudo -n /usr/local/sbin/web-password $u" >/dev/null
+  { grep -v "^$u " "$pwf" || true; printf '%s %s\n' "$u" "$pw"; } > "$pwf.tmp" && mv "$pwf.tmp" "$pwf"
+done
+unset pw
+
 echo
+echo "Web app: https://$ip/   (self-signed certificate: accept the browser warning)"
+echo "Sign in as testa, testb or testa2. Passwords are in $pwf"
 echo "Ready. VM $ip. Reviewers log in with: ssh -i $loc/test-keys/testa -o UserKnownHostsFile=$loc/.ssh/known_hosts -o HostKeyAlias=review-vm testa@$ip"
 echo "Run the tests:  cd $gr && REVIEW_ENV=local/review.env ./acceptance.sh [--with-resource]"
 echo "Tear down:      $loc/down"
