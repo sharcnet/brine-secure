@@ -3,7 +3,7 @@
 
 flavor         = "c16-32gb"              # example; about 16 vCPU / 32 GB with a root disk
 key_pair       = "admin-key"
-volume_type    = "encrypted"             # must be an encrypted type; check with your cloud
+# volume_type  = "encrypted"             # optional; unset = the cloud default (PRIMER §4)
 reviewer_cidrs = ["192.0.2.0/24"]        # campus / VPN ranges
 admin_cidrs    = ["198.51.100.10/32"]    # admin VPN
 dns_cidrs      = ["192.0.2.53/32"]

@@ -17,7 +17,8 @@ what to verify, and holds the acceptance tests.
 > - New controls: per-reviewer disk quotas, a size-limited `/tmp`, fail2ban, MaxAuthTries 3,
 >   `DisableForwarding`, and admin SSH limited to allowlisted addresses (pam_access).
 > - A list of the settings brine needs, now shared as `../BRINE-REQUIREMENTS.md`.
-> - §11 grew from 22 to 61 tests, including a canary test for content logging.
+> - §11 grew from 22 to 61 tests, including a canary test for content logging. (53 since the
+>   web-only change of 2026-11-18.)
 >
 > **Revision 2026-11-10b:** moved into `sharcnet/brine-secure` as a second deployment. The
 > inline code became real files (`review`, `terraform/`, `image/`, `vm/`). Findings from
@@ -96,16 +97,15 @@ assigned applications before the reviewer gets access.
 ### Architecture
 
 ```
-reviewer laptop                          admin laptop (allowlisted address)
-   │ ssh; sftp download-only                │ ssh (admin, not a reviewer)
-   │ (public key only, no forwarding)       │ load-applications
+reviewer's browser                       admin VM (same project, fixed address)
+   │ HTTPS (sign-in; CILogon + MFA later)   │ ssh (admins only; reviewers have no SSH)
+   │                                        │ load-applications
    ▼                                        ▼
 ┌───────────────────────────── VM (Ubuntu 24.04) ──────────────────────────────┐
-│ sshd ── Match Group reviewers ── ForceCommand ──► sudo enter-review          │
-│                                                     │ podman exec            │
+│ nginx :443 ── signed-in, ACTIVE reviewer ──► /run/review-web/alice/web.sock  │
+│                                                     │                        │
 │  ┌──────── container review-alice (network=none) ───▼─────────────────────┐  │
-│  │ user "reviewer": bash, pi, pdftotext, rg, fd, nano                     │  │
-│  │ sftp-server -R (read-only: download, never upload)                     │  │
+│  │ user "reviewer": web app (node), pi --mode rpc, pdftotext              │  │
 │  │ user "fwd" (PID 1): node forwarder 127.0.0.1:4000 ──┐                  │  │
 │  │ /home/reviewer           ◄─ /srv/review/homes/alice │                  │  │
 │  │ /home/reviewer/originals ◄─ /srv/review/originals/  │                  │  │
@@ -174,7 +174,7 @@ Why this design:
 | OpenStack credentials (openrc / clouds.yaml), project, network name | `def-sharcnet-review`, `def-net` |
 | **Who has a role in that project** (only the review admins; anyone with a role can snapshot the VM or open its console) | |
 | Image, flavour, admin keypair name | Ubuntu 24.04, 16 vCPU / 32 GB, `admin-key` |
-| Encrypted Cinder volume type available? (name) | `LUKS` |
+| Cinder volume type (encrypted is optional, see §4) | default |
 | CIDR(s) allowed to SSH in (reviewers) | campus/VPN ranges |
 | Admin address(es) allowed to log in as an admin (narrower than the above) | admin VPN range |
 | brine base URL, its IP(s), path prefix if any, and whether it uses an internal CA | `https://brine.example.ca` |
@@ -200,17 +200,27 @@ they do and why, and lists what to verify.
 
 | Path | Runs where | What it does |
 |---|---|---|
-| `review` | Admin laptop | One CLI for everything below. Reads `review.env` |
-| `terraform/` | Laptop → OpenStack | VM, encrypted data volume, security groups, floating IP |
-| `image/` | A Linux x86_64 build host | Builds the reviewer container image and saves it as a tarball |
+| `admin-vm/` | Horizon, once | The admin VM: cloud-init and `setup`. Everything below runs there (or on a laptop) |
+| `review` | Admin VM | One CLI for everything below. Reads `review.env` |
+| `terraform/` | Admin VM → OpenStack | VM, data volume, security groups, floating IP |
+| `image/` | Admin VM (x86_64, podman) | Builds the reviewer container image and saves it as a tarball |
 | `vm/configure` | VM, as root | Installs packages and every config file; safe to run again |
-| `vm/sbin/` | VM, as root | `enter-review` and the admin scripts |
+| `vm/sbin/` | VM, as root | The admin scripts |
 | `vm/files/` | VM | nginx, sshd, sudoers, nftables, fail2ban, pam_access, Quadlet template, pi `models.json` |
 | `../BRINE-REQUIREMENTS.md` | brine | What brine's admins must set, shared with the sandbox deployment |
 
+**The admin VM (decision 2026-11-18).** Command and control runs on a small VM in the same
+project, not on anyone's laptop: Terraform and its state, `review`, the image build and key
+minting. Each admin has a named account there (group `gradmin`). It reaches the review VM on
+the project network (`VM_ADDRESS=fixed`), so `admin_cidrs` is its fixed address. It adds no one
+new to the trust boundary, because anyone with a project role can already reach the review
+VM's console. Applications pass through it only in RAM (`/run/grant-review/incoming`). See
+[admin-vm/README.md](admin-vm/README.md).
+
 Secrets never sit in this repo, in Terraform state, in user data or in a command line:
 
-- The LiteLLM credential that mints keys stays on the laptop, as a 0600 header file.
+- The LiteLLM credential that mints keys stays on the admin VM, in `/etc/grant-review`
+  (root:gradmin 0640).
 - Each new reviewer key is held in a shell variable and piped to `add-reviewer` over SSH.
 - `add-reviewer` writes the key into nginx with shell built-ins only.
 
@@ -230,8 +240,13 @@ Secrets never sit in this repo, in Terraform state, in user data or in a command
 - **Server:** Ubuntu 24.04 with the admin keypair. `config_drive = true`, so cloud-init never
   needs the metadata service. User data holds no secrets, and swap is off.
   - `ignore_changes = [image_id]`, so a newer Ubuntu image never rebuilds a VM that holds data.
-- **Data volume** of `volume_type`, which must be an encrypted type. It has
-  `prevent_destroy`, so retention (§12) is the only way it goes.
+- **Data volume** of `volume_type` (the cloud's default if unset). It has `prevent_destroy`,
+  so retention (§12) is the only way it goes.
+  - **Encryption is optional (decision 2026-11-18).** This deployment uses an unencrypted
+    volume. The cost: Ceph doesn't wipe deleted volumes, so retention overwrites the volume
+    before deleting it, and that is best effort (old copies can survive in Ceph until reused).
+    If a competition owner needs guaranteed destruction, set an encrypted `volume_type`; then
+    deleting its key in Barbican destroys the data.
 - **Floating IP**, with the same router-gateway check as the sandbox.
 
 ```bash
@@ -246,8 +261,6 @@ terraform -chdir=terraform init
 port carries only the review group, prints that group's egress rules, and lists the open
 connections on the VM.
 
-**[VERIFY]** whether this cloud's volume type is really encrypted:
-`openstack volume show <id> -c encrypted`.
 
 **Who's in the OpenStack project matters.** Anyone with a role in it can:
 
@@ -280,7 +293,8 @@ It then converges the VM:
 1. Installs `podman nginx nftables uidmap tini fail2ban quota jq unattended-upgrades`.
 2. Sets up subordinate IDs for `UserNS=auto` and creates the `reviewers` group.
 3. Creates the directories (homes, originals, staging, manifests, key aliases).
-4. Installs `enter-review` (0755) and the admin scripts (0700) in `/usr/local/sbin`.
+4. Installs the admin scripts (0700) in `/usr/local/sbin`, and removes the old SSH entry
+   pieces (`enter-review`, its sudo rule, `/etc/ssh/authorized_keys`) if present.
 5. Sets up nginx:
    - removes the default site;
    - installs the brine snippet, with brine's name as both Host and SNI;
@@ -323,9 +337,8 @@ review VM while `setup_egress` is on, before anything is loaded.
   no bash tool **[VERIFY]** the flag with `pi --help`.
 
 ```bash
-# on the build host
+# on the admin VM (x86_64, podman)
 grant-review/image/build                 # refuses if curl, python3, git, npm, sudo... are present
-# on the laptop
 ./review image brine-review-YYYYMMDD.tar # checks the sha256 on the VM, loads it, tags :current
 ```
 
@@ -368,36 +381,30 @@ is an accepted residual risk. **[VERIFY]** the socket mode once it exists.
 
 ---
 
-## 8. Phase 5: SSH entry (`enter-review`, sudoers, sshd, nftables)
+## 8. Phase 5: reviewers use the web page only (sshd, pam_access, nftables)
 
-- **sshd (`Match Group reviewers`):**
-  - public key only
-  - `ForceCommand sudo -n /usr/local/sbin/enter-review`
-  - `DisableForwarding` plus every forwarding, tunnel and user-rc option off
-  - `MaxAuthTries 3` and `PermitRootLogin no` globally
+**Decision 2026-11-18: reviewers have no SSH access at all.** Everything they do is on the web
+page (§8.1). This removes the SSH entry path (`enter-review`, its sudo rule, sftp downloads and
+the forwarding controls) and the attack surface that came with it. `configure` deletes those
+pieces from a VM that had them.
 
-  The sftp `Subsystem` line stays in the main `sshd_config`. `configure` checks that it's there.
-- **sudoers:** `%reviewers ALL=(root) NOPASSWD: /usr/local/sbin/enter-review ""`, where `""`
-  means no arguments. `SSH_ORIGINAL_COMMAND` is kept.
-- **`enter-review`** picks the container from `SUDO_USER` only. It runs:
-  - an interactive shell (or pi only, if `REVIEWER_SHELL=pi`) with `podman exec`, or
-  - `sftp-server -R` (read-only).
-
-  It refuses every other remote command, including legacy `scp -O`. For an sftp request,
-  OpenSSH 9.6 sets `SSH_ORIGINAL_COMMAND` to the configured subsystem command **plus a trailing
-  space**, so `enter-review` trims surrounding whitespace before its exact match (found on the
-  local test VM).
-- **pi-only mode** is a usability choice, not a stronger boundary. pi can run shell commands
-  from its editor **[VERIFY]**, and extensions are code.
+- **sshd:** `DenyGroups reviewers`, refused before authentication. `MaxAuthTries 3` and
+  `PermitRootLogin no` globally. Admins only.
+- **Security group:** port 22 accepts only `admin_cidrs`; `reviewer_cidrs` reach 443 only.
+- **pam_access:** `-:(reviewers):ALL`, so a reviewer account can't log in from anywhere, even
+  if sshd were misconfigured.
+- **Accounts:** reviewers have no password and `/usr/sbin/nologin` as their shell. The account
+  exists for the UID (project quota), the `reviewers` group (nftables) and the container.
 - **nftables:** `meta skgid <reviewers> drop` on output. This also covers the metadata service.
 - **fail2ban** sshd jail, with the admin addresses in `ignoreip`.
-
-A reviewer's key starts as `/etc/ssh/authorized_keys/<user>.pending`, which sshd ignores.
-`activate-reviewer` renames it.
+- **Pending reviewers:** `/etc/brine-review/pending/<user>` marks a reviewer who is added but
+  not yet activated. `activate-reviewer` removes it (§8.1).
+- **Image [follow-up]:** the image still carries `openssh-sftp-server`, now unreachable. Drop it
+  at the next image build. (`pi-review` stays: tests 33 and 34 use it from the admin side.)
 
 ### 8.1 Web front end (HTTPS)
 
-Most reviewers will never use SSH. They sign in at `https://<VM>/` and get a three-panel page:
+Reviewers sign in at `https://<VM>/` and get a three-panel page:
 - **left:** their applications
 - **middle:** the original (the browser's PDF viewer) or its extracted text
 - **right:** an assistant panel, plus their notes for that application
@@ -422,6 +429,11 @@ browser ──HTTPS──► VM: nginx :443 ── sign-in (basic auth now; SSO 
 - **Sign-in and routing:**
   - nginx (`vm/files/nginx-web.conf`) serves TLS on 443 and checks the password against
     `/etc/brine-review/web/htpasswd`, set with `review web-password <user>`.
+  - **Activation gates the web too (fixed 2026-11-18).** Until then, a reviewer with a web
+    password could sign in before the second-person check. Now a pending reviewer's password
+    goes to `htpasswd.pending`, which nginx never reads, and `activate-reviewer` moves it
+    across. Test 51 checks a pending reviewer gets 401 on the web.
+  - **Web only:** reviewers have no SSH (§8).
   - It picks the socket only from the verified user name: a non-name maps to a path that
     can't exist.
   - It strips the `Authorization` header, so the password never reaches the container.
@@ -446,10 +458,33 @@ browser ──HTTPS──► VM: nginx :443 ── sign-in (basic auth now; SSO 
   - Application names must match the loader's strict pattern.
   - Notes are never written through a symlink.
 - **Not in the web page:** uploads, sharing, a shell, other users' anything.
-- **SSO for production [OPEN]:** basic auth with per-reviewer random passwords is fine for a
-  pilot. For the competition, put the institution's sign-on in front, e.g. oauth2-proxy with
-  `auth_request` to the identity provider, and map the signed-in identity to the reviewer name
-  in `$review_sock`'s `map`. Everything behind that line stays the same.
+- **SSO: CILogon (chosen 2026-11-18) [OPEN, not built yet].** Basic auth with per-reviewer
+  passwords is for the pilot. For the competition, reviewers sign in through
+  [CILogon](https://www.cilogon.org/oidc) with their Alliance (CCDB) account, the same login and
+  MFA as CCDB. The Alliance IdP `https://idp.alliancecan.ca/idp/shibboleth` is in CILogon's list
+  and releases the R&S attributes. The plan:
+  - **Client:** a confidential OIDC client registered at https://cilogon.org/oauth2/register.
+    It's free for academic research (Basic tier) and approved by hand, about a day. Scopes:
+    `openid email profile org.cilogon.userinfo` (the last one carries `eppn` and `idp`).
+    Callback: `https://<review host name>/oauth2/callback`.
+  - **On the VM:** oauth2-proxy (one pinned, checksummed binary) on 127.0.0.1, with nginx
+    `auth_request`. `idphint` sends reviewers straight to the Alliance login. The hint is only
+    a hint, so the server also checks it: only `eppn` ending `@<Alliance scope>` is accepted.
+    Its local part must be an *active* reviewer's name, or nginx refuses. The active list is
+    a map file that `activate-reviewer` and `remove-reviewer` maintain, replacing
+    `htpasswd`.
+  - **Usernames:** reviewer names are their CCDB usernames, so no mapping table is needed.
+  - **Egress:** the review VM's security group gains `cilogon.org` (443 to 75.2.49.220 and
+    99.83.186.75, AWS Global Accelerator) for the token and key endpoints. Containers still have
+    no network.
+  - **Needs:** a DNS name and a publicly trusted certificate for the review VM (the callback
+    must be HTTPS), and the Alliance eppn format confirmed at https://cilogon.org/testidp/.
+  - **MFA is required (decision 2026-11-18).** The sign-in asks for it with
+    `acr_values=https://refeds.org/profile/mfa`, and the server refuses any ID token whose
+    `acr` claim isn't that value. With oauth2-proxy: `--oidc-groups-claim=acr` plus
+    `--allowed-group=https://refeds.org/profile/mfa`. **[VERIFY]** that the Alliance IdP
+    signals REFEDS MFA (its Duo step) through CILogon. If it doesn't, ask the Alliance, because
+    without that signal MFA can't be enforced here.
 - **Certificate:** `configure` makes a self-signed certificate if none exists. Replace
   `/etc/brine-review/web/tls.crt` and `tls.key` with a real one (same paths).
 
@@ -471,10 +506,11 @@ this. Instead:
 
 ```bash
 ./review add alice alice.pub          # mints the key on brine, creates everything, login OFF
-./review stage P123.pdf P456.pdf      # streamed onto the encrypted volume's staging dir
+./review stage P123.pdf P456.pdf      # streamed onto the data volume's staging dir
 ./review load assignment.csv          # username,filename lines from the competition owner
 ./review manifest alice               # second person compares this with the assignment list
 ./review activate alice "J. Smith"    # login ON; records who checked
+./review list                         # each application and its reviewers
 ```
 
 - **`add-reviewer`** (VM):
@@ -487,7 +523,7 @@ this. Instead:
 
   The key arrives on stdin. The opaque alias `gr-<8 hex>` is recorded in
   `/etc/brine-review/keys/aliases`.
-- **Keys** (laptop, `review add`):
+- **Keys** (admin VM, `review add`):
   - Minted by `POST /key/generate` with `team_id`, `key_alias`, `models`, `duration`,
     `max_budget`, `rpm_limit` and `tpm_limit` from `review.env` **[VERIFY]** the field names
     on brine's LiteLLM version.
@@ -507,6 +543,16 @@ this. Instead:
   is free text in a log line, so nothing stops one admin loading, "checking" and activating
   alone. Treat it like any other two-person rule: it works only if people follow it.
   `activate-reviewer` re-checks the manifest before switching the login on.
+- **`review list`** (VM: `list-assignments`) reports who has which application, from what is
+  actually on the VM: the files in each reviewer's `originals`, the accounts and their login
+  state. It is read-only and never opens an application.
+  - `review list` (or `applications`): each application with its reviewers and their status
+    (`active` or `pending`). It also names reviewers with no applications and
+    anything staged but not loaded.
+  - `review list reviewers`: each reviewer with status, web sign-in set, container up,
+    manifest `ok` or `MISMATCH`, and their applications.
+  - `review list csv`: `username,filename,status` lines, the assignment list's shape, so
+    `diff <(cut -d, -f1,2 list.csv | sort) <(sort assignment.csv)` shows any difference.
 - **Staging is emptied by `load-applications` itself.** Once every copy and manifest is
   written, it deletes the staged copies it loaded, and the assignment list if it was sent
   with `review load`. It warns if anything else is left in staging.
@@ -546,7 +592,7 @@ two test reviewers before rolling it out:
 - The container must be able to connect to the host Unix socket, which needs runsc's
   host-UDS option (e.g. `--host-uds=open`). **[VERIFY]** the flag, and how to pass runtime
   flags from Quadlet (`GlobalArgs=`/`PodmanArgs=`) on this Podman version.
-- Check that `UserNS=auto`, `podman exec`, the sftp path and the forwarder all still work.
+- Check that `UserNS=auto`, `podman exec`, the web app and the forwarder all still work.
   Run the whole of §11 under gVisor.
 - If anything doesn't work, don't force it. Leave gVisor off and tell the human, because the
   rest of the design is still sound.
@@ -555,16 +601,17 @@ two test reviewers before rolling it out:
 
 ## 11. Acceptance tests
 
-Create three test reviewers, `testa`, `testb` and `testa2`, each with their own SSH key and
-LiteLLM key. `testa2` is there on purpose: its name starts with another reviewer's name, which
+Create three test reviewers, `testa`, `testb` and `testa2`, each with their own LiteLLM key
+and a web password. `testa2` is there on purpose: its name starts with another reviewer's name, which
 catches prefix and glob bugs in socket, home and container paths. Load `sample.pdf` (and a
 `sample.txt`) for each with `review stage` and `review load`, check the manifests, and activate them (§9).
 
 `acceptance.sh` runs the suite from the laptop and writes a dated log to `test-logs/` with
 the result and output of every test: PASS, FAIL, MANUAL (needs a person, often a brine admin;
-the log says what to check) or SKIP. Put the test reviewers' SSH private keys in
-`test-keys/testa`, `test-keys/testb` and `test-keys/testa2` (gitignored). It plants and removes
-the canaries itself.
+the log says what to check) or SKIP. Put the test reviewers' web passwords in the file named
+by `WEB_PASSWORDS_FILE` (`<user> <password>` lines, gitignored). It plants and removes the
+canaries itself. Tests that look inside a container use `podman exec` as the container's
+`reviewer` user, from the admin side, because reviewers have no shell access of their own.
 
 ```bash
 ./acceptance.sh                    # everything safe to repeat
@@ -573,33 +620,30 @@ the canaries itself.
 ./acceptance.sh --only 23,24,25    # a subset
 ```
 
-Set `PENDING_USER` to a test reviewer who is added but not activated, to cover the last part of
-test 51. Tests 10, 27, 49, 50 and 53 are always MANUAL; 26 is automated on the VM side, with a
+Set `PENDING_USER` to a test reviewer who is added but not activated, and give them a web
+password, to cover the last part of test 51. Tests 10, 27, 49, 50 and 53 are always MANUAL; 26 is automated on the VM side, with a
 brine-side confirmation. Run the whole suite:
 
 - before go-live
 - after every image rebuild (§9.2)
-- after any upgrade to sshd, nginx, Podman, LiteLLM or the brine model servers
+- after any upgrade to sshd, nginx, oauth2-proxy, Podman, LiteLLM or the brine model servers
 - after every reboot
 
-Unless a test says otherwise, run it from the laptop as `testa`, or inside `testa`'s container.
+Unless a test says otherwise, it runs inside `testa`'s container, as `reviewer`.
 
 **Setup canaries (admin, on the host):** put a file containing `HOST-CANARY-<random>` in
 `/root/` and a file containing `TESTB-CANARY-<random>` in `/srv/review/homes/testb/`. If either
 string ever shows up in `testa`'s session, the test that showed it failed.
 
-### 11.1 SSH entry
+### 11.1 No reviewer SSH
 
 | # | Test | Expected |
 |---|---|---|
-| 1 | `ssh testa@VM` | Prompt `review:~$`; `id` shows `reviewer` |
-| 2 | `ssh testa@VM whoami`; `ssh -t testa@VM bash`; `ssh -s testa@VM foo` | All refused ("remote commands are not allowed" / subsystem request failed) |
-| 3 | `ssh -N -L 9999:BRINE_HOST:443 testa@VM`, then `curl localhost:9999` from the laptop. Also try `-D 1080`, `-R 9999:localhost:22`, `-W BRINE_HOST:443`, `-w 0:0` and `-X` | All refused |
-| 4 | `ssh -A testa@VM`, then inside: `echo $SSH_AUTH_SOCK` | Empty; no agent socket in the container |
-| 5 | `LC_EVIL='$(id)' ssh -o SendEnv=LC_EVIL testa@VM`, then `echo $LC_EVIL` | Empty |
-| 6 | `ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive testa@VM` | `Permission denied (publickey)` |
-| 7 | Legacy scp: `scp -O testa@VM:originals/sample.pdf .` | Fails (it needs a remote command) |
-| 8 | On the host as admin: `sudo sshd -T -C user=testa,host=x,addr=203.0.113.1 \| grep -Ei 'passwordauth\|kbdinteractive\|permitroot\|forwarding\|permittunnel\|permituser\|maxauthtries\|forcecommand'` | `passwordauthentication no`, `kbdinteractiveauthentication no`, `permitrootlogin no`, `disableforwarding yes`, `allowtcpforwarding no`, `allowagentforwarding no`, `allowstreamlocalforwarding no`, `x11forwarding no`, `permittunnel no`, `permituserrc no`, `permituserenvironment no`, `maxauthtries 3`, the expected `forcecommand` |
+| 1 | As admin, plant a throwaway key in the reviewers' shared home (`/var/lib/reviewers/home/.ssh/authorized_keys`), then `ssh -i <that key> testa@VM`; remove the key | `Permission denied`; the sshd log says DenyGroups |
+| 2 | `getent passwd testa`; `passwd -S testa`; `grep reviewers /etc/security/access.conf` | Shell `/usr/sbin/nologin`; password locked; `-:(reviewers):ALL` (after `configure --admin-access`) |
+| 3 | `ls -d /usr/local/sbin/enter-review /etc/sudoers.d/reviewers /etc/ssh/authorized_keys`; `sudo -l -U testa` | None exist; testa may not run sudo |
+| 4 | `openstack security group rule list <review group> --ingress` | Port 22 only from `ADMIN_CIDRS`; reviewers' ranges reach 443 only |
+| 5 | `sudo sshd -T -C user=testa,host=x,addr=203.0.113.1` | `denygroups reviewers`, `permitrootlogin no`, `permituserenvironment no`, `maxauthtries 3` |
 | 9 | On the host as admin: `sudo fail2ban-client status sshd` | Jail is active |
 | 10 | An admin login from an address outside the admin allowlist | Refused (pam_access) |
 
@@ -634,10 +678,7 @@ string ever shows up in `testa`'s session, the test that showed it failed.
 
 | # | Test | Expected |
 |---|---|---|
-| 28 | `sftp testa@VM`: `ls originals`, `get originals/sample.pdf`, then `put x.txt`, `put x.txt originals/`, `mkdir d`, `rm originals/sample.pdf`. Also `scp testa@VM:originals/sample.pdf .` and `scp x.txt testa@VM:` | Downloads work; every upload, mkdir and rm is refused |
 | 29 | On the host as admin: `cd /srv/review/originals/testa && sha256sum -c /srv/review/manifests/testa.sha256`; `stat -c '%U %a %n' *`; compare with the assignment list | All `OK`; exactly the assigned files; `root 444` |
-| 30 | In sftp: `cd /`, `ls`, `ls /home`, `ls /run/brine`, `get /root/*`, `get /srv/review/homes/testb/*` | You see only the container's view, never the host's files or testb's. No canary is retrieved |
-| 31 | Inside the container: `ln -s /root ~/r; ln -s /srv/review/homes/testb ~/b`. Then in sftp: `ls r`, `ls b`, `get -r r`, `get -r b` | Fails, or shows the container's own (empty) paths. No canary is retrieved |
 | 32 | `pdftotext ~/originals/sample.pdf ~/sample.txt && head ~/sample.txt` | Text output |
 | 33 | `pi -p "Summarise the main aims in ~/originals/sample.txt"` using a brine model. Meanwhile, as admin, watch `/var/log/nginx/brine-testa.access.log` | An answer that uses the file. The log shows only `/v1/models` and `/v1/chat/completions` |
 | 34 | In pi, ask it to "run `ls /` with bash" | It can't; there is no bash tool |
@@ -657,14 +698,12 @@ fork-bomb and memory-hog processes are gone (log out of `testa` first if needed)
 
 | # | Test | Expected |
 |---|---|---|
-| 38 | `sudo -l -U testa` | Only `enter-review` |
-| 39 | `stat -c '%U %a %n' /usr/local/sbin/enter-review /usr/local/sbin /usr/local /usr` | All owned by root; none group- or world-writable |
-| 40 | `sudo -u testa sudo -n /usr/local/sbin/enter-review testb` | Refused by sudo (no arguments allowed) |
+| 39 | `stat -c '%U %a %n' /usr/local/sbin /usr/local/sbin/add-reviewer /usr/local /usr` | All owned by root; none group- or world-writable |
 | 41 | `ls -ld /run/brine-proxy/*`; `podman inspect review-testa --format '{{range .Mounts}}{{.Source}} {{end}}'` | Each directory is root 0755 and holds only `brine.sock`. testa's container mounts only `/run/brine-proxy/testa`, `/run/review-web/testa`, `/srv/review/homes/testa`, `/srv/review/originals/testa` and `models.json` |
 | 42 | `sudo -u testa curl -m5 https://BRINE_HOST`; `sudo -u testa curl -m5 http://169.254.169.254/` | Both fail (nftables drop) |
 | 43 | `curl -s http://169.254.169.254/openstack/latest/user_data`, and the config drive (`blkid -L config-2`, mount read-only, read `openstack/latest/user_data`) | Contains no secrets |
 | 44 | `curl -m5 https://example.com` | Blocked by the security group. `review check` shows only the review group on the port |
-| 45 | `swapon --show`; `findmnt /srv/review`; from the laptop: `openstack volume show <data-volume> -c encrypted` | No swap. `nodev,nosuid,noexec,prjquota`. `encrypted: True` |
+| 45 | `swapon --show`; `findmnt /srv/review` | No swap. `nodev,nosuid,noexec,prjquota` |
 | 46 | `openstack volume snapshot list`; `openstack image list --private`; `ls /var/lib/nginx/body /var/lib/nginx/proxy` | No snapshots or images of the VM or data volume. nginx temp dirs empty |
 
 ### 11.7 No content is logged (canary)
@@ -682,10 +721,10 @@ This is the evidence for the Tri-agency sign-off (§12), so don't skip it.
 
 | # | Test | Expected |
 |---|---|---|
-| 51 | `ssh testb@VM` and `ssh testa2@VM` while testa is connected; before `activate-reviewer`, `ssh` as a fourth test user | Each lands in its own container, never another reviewer's. testa2 sees nothing of testa. The not-yet-active user is refused |
-| 52 | Revoke testa's LiteLLM key while testa is in a session | testa's next request fails (401) within a minute or two (LiteLLM caches keys briefly). testb is unaffected |
+| 51 | Read a marker file in testb's and testa2's containers; before `activate-reviewer`, sign in on the web as a fourth test user | Each container holds its own reviewer's home, never another's. The not-yet-active user gets 401 |
+| 52 | Revoke testa's LiteLLM key while testa's container is running | testa's next request fails (401) within a minute or two (LiteLLM caches keys briefly). testb is unaffected |
 | 53 | Reboot the VM | Run the **entire** suite again, not just the functional tests. The usual failure is that things work again but the controls didn't come back |
-| 54 | `remove-reviewer --purge-data testa` | testa's container, socket, home, originals, manifest and user are gone; the key is revoked; `ssh testa@VM` fails. **testa2 still works**: re-run tests 1, 23 and 28 as testa2 |
+| 54 | `remove-reviewer --purge-data testa` | testa's container, socket, home, originals, manifest and user are gone; the key is revoked; testa's web sign-in fails. **testa2 still works**: its container, model path (23) and web sign-in (58) |
 
 ### 11.9 brine's shared IP and leftover connections
 
@@ -737,10 +776,10 @@ canary files.
 - **Loading applications:** admins copy each reviewer's applications from the competition
   owner's assignment list into `~/originals` (root-owned, read-only). The copy produces a
   checksum manifest, and a second person checks it against the list before the reviewer is
-  activated. Staging copies sit on the encrypted volume and are deleted once the loading is
+  activated. Staging copies sit on the data volume and are deleted once the loading is
   checked. The copy script never opens the files.
 - **Data at rest:** homes, originals, manifests, staging and pi's session history are all on
-  the encrypted Cinder volume. Containers' root filesystems are the read-only image; `/tmp`
+  the Cinder data volume (not encrypted, see §4). Containers' root filesystems are the read-only image; `/tmp`
   is tmpfs, and there is no swap. nginx doesn't buffer bodies to disk. Backups are off by
   default; if any are made, they're encrypted and covered by the same retention rule. Don't
   take snapshots or images of the VM or the volume.
@@ -749,14 +788,14 @@ canary files.
   prompt storage and callbacks off in LiteLLM. Delete these logs after the agreed
   log-retention period.
 - **What counts as content:** applications, extracted text, reviewers' notes, and pi's
-  transcripts in `~/.pi/agent/sessions`. All of it lives on the encrypted volume and is
+  transcripts in `~/.pi/agent/sessions`. All of it lives on the data volume and is
   purged with the reviewer's data.
 - **OpenStack project:** only the review admins have a role in it. Anyone with a role can
   snapshot the VM, attach a security group or open the console, so project membership is part
   of the trust boundary. Application credentials get an expiry date.
 - **Access:**
-  - Reviewers use SSH keys only.
-  - Publish the host key fingerprint (from `review pin-hostkey`) through a separate channel.
+  - Reviewers use the web page only (a password now, CILogon with MFA later). Sign-in stays
+    off until activation. Reviewers have no SSH access.
   - Admin logins are allowed only from allowlisted addresses (pam_access).
   - fail2ban watches sshd.
 - **Offboarding during the review** (conflict of interest, withdrawal or a lost key): for one
@@ -766,8 +805,10 @@ canary files.
 - **Retention:** on the agreed date:
   1. Run `remove-reviewer --purge-data` for everyone, and revoke all keys (they also expire).
   2. Check that no snapshots, images or backups exist.
-  3. Delete the data volume and confirm its encryption key is gone from Barbican. Ceph
-     doesn't wipe deleted volumes, so deleting the key is what actually destroys the data.
+  3. Ceph doesn't wipe deleted volumes. Unmount `/srv/review`, overwrite the volume from
+     the VM (`dd if=/dev/zero of=/dev/vdb bs=4M oflag=direct status=progress`), then delete
+     it. That is best effort. With an encrypted volume type instead, confirm its key is gone
+     from Barbican; that is what destroys the data.
   4. Delete the VM if it's no longer needed.
 
   Record the date each step was done.
@@ -790,30 +831,25 @@ canary files.
 ## 13. Reviewer quick-start (hand this to reviewers once it's live)
 
 ```
-First connection: check the server's fingerprint matches the one we sent you separately:
-                  SHA256:<fingerprint>
-                  If it doesn't match, don't type "yes"; contact <admin contact>.
-
-Connect:           ssh <you>@<VM>
-Your applications: already in ~/originals (read-only); you can't upload files
-Set up a folder:   mkdir -p ~/work/P123 && cd ~/work/P123
-PDF to text:       pdftotext ~/originals/proposal.pdf proposal.txt
-Start pi:          pi            # file tools only; models come from brine
-One-shot:          pi -p "Summarise the aims and methods in proposal.txt"
-Download:          scp <you>@<VM>:work/P123/notes.md .
+Sign in:      https://<review host>/  with your Alliance (CCDB) account and its MFA
+              (until single sign-on is live: the username and password we sent you)
+Left:         the applications assigned to you
+Middle:       the original PDF, or its extracted text
+Right:        the assistant, and your notes for that application
+Download:     your notes and the conversation, as Markdown
 ```
 
 - **Private and offline.** Only you can see your workspace. It has no internet access; the only
-  thing it can reach is the brine models. Your prompts and pi's answers aren't logged. pi keeps
-  your session history inside your workspace, and it's deleted along with everything else.
-- **Originals are protected.** The applications assigned to you are already in `~/originals`.
-  It's read-only, so pi can't change them. If something is missing, or you have a conflict
-  of interest, contact <admin contact>. Keep each application's work in its own folder under
-  `~/work`.
-- **pi gives advice, not verdicts.** Applications can contain hidden instructions meant for AI
-  tools. Check what pi tells you against the original, and don't open links that pi produces.
+  thing it can reach is the brine models. Your prompts and the assistant's answers aren't
+  logged. Your conversation history stays in your workspace, and it's deleted along with
+  everything else.
+- **Originals are protected.** The applications assigned to you are already loaded and
+  read-only, so the assistant can't change them. You can't upload files. If something is
+  missing, or you have a conflict of interest, contact <admin contact>.
+- **The assistant gives advice, not verdicts.** Applications can contain hidden instructions
+  meant for AI tools. Check what it tells you against the original.
 - **Keep it here.** Don't copy application content into any other AI tool.
 - **Deletion.** Your workspace and everything in it will be deleted on **<retention date>**.
   Download anything you're allowed to keep before then.
-- **Problems** (a lost key, a conflict of interest, or leaving the review): contact
+- **Problems** (a conflict of interest, a lost account, or leaving the review): contact
   <admin contact> right away.

@@ -13,7 +13,8 @@ u=$1 purge=false
 valid_user "$u" || die "bad username: $u"
 
 # Login off first, so nobody gets in while the rest is torn down.
-rm -f -- "/etc/ssh/authorized_keys/$u" "/etc/ssh/authorized_keys/$u.pending"
+rm -f -- "$PENDING_DIR/$u"
+for f in "$WEB_HT" "$WEB_HT.pending"; do [[ -f $f ]] && sed -i "/^$u:/d" "$f"; done
 pkill -KILL -u "$u" 2>/dev/null || true
 
 systemctl stop "review-web@$u.service" "review-$u.service" 2>/dev/null || true
@@ -25,9 +26,6 @@ rm -f -- "/etc/nginx/brine-users/$u.conf"
 nginx -t -q && systemctl reload nginx
 rm -f -- "/etc/tmpfiles.d/brine-proxy-$u.conf" "/etc/tmpfiles.d/brine-review-$u.conf"
 rm -rf -- "/run/brine-proxy/$u" "/run/review-web/$u"
-if [[ -f /etc/brine-review/web/htpasswd ]]; then
-  sed -i "/^$u:/d" /etc/brine-review/web/htpasswd
-fi
 
 uid=$(id -u "$u" 2>/dev/null || true)
 id "$u" &>/dev/null && userdel "$u"

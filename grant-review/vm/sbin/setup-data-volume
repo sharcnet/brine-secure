@@ -1,7 +1,7 @@
 #!/bin/bash
 # setup-data-volume <device>      e.g. /dev/vdb
 #
-# Formats the (encrypted Cinder) data volume with project quotas and mounts it at
+# Formats the Cinder data volume with project quotas and mounts it at
 # /srv/review. Refuses any device that already holds a filesystem or partition table, so it
 # can't wipe data. The one exception is a volume this script already formatted (label
 # brine-review, already in fstab) that isn't mounted: then it only mounts it. Runs before

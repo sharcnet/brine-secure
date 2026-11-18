@@ -21,18 +21,13 @@ admin_access=false
 [[ -r $src/review.conf ]] || die "$src/review.conf missing (review deploy writes it)"
 # shellcheck source=/dev/null
 source "$src/review.conf"
-for v in BRINE_HOST ADMIN_CIDRS QUOTA_GB REVIEWER_SHELL CTR_MEMORY CTR_CPUS CTR_PIDS; do
+for v in BRINE_HOST ADMIN_CIDRS QUOTA_GB CTR_MEMORY CTR_CPUS CTR_PIDS; do
   [[ -n ${!v:-} ]] || die "review.conf: $v is not set"
 done
 [[ $BRINE_HOST =~ ^[a-z0-9.-]+$ ]] || die "bad BRINE_HOST"
 [[ $ADMIN_CIDRS =~ ^[0-9a-fA-F.:/\ ]+$ ]] || die "bad ADMIN_CIDRS"
 [[ $QUOTA_GB =~ ^[0-9]+$ && $CTR_CPUS =~ ^[0-9.]+$ && $CTR_PIDS =~ ^[0-9]+$ ]] || die "bad limits"
 [[ $CTR_MEMORY =~ ^[0-9]+[kmg]$ ]] || die "bad CTR_MEMORY"
-case $REVIEWER_SHELL in
-  bash) shell_cmd="/bin/bash -l" ;;
-  pi)   shell_cmd="/usr/local/bin/pi-review" ;;
-  *)    die "REVIEWER_SHELL must be bash or pi" ;;
-esac
 
 # The data volume comes first (setup-data-volume): everything confidential lives on it.
 mountpoint -q /srv/review || die "/srv/review is not mounted; run setup-data-volume first"
@@ -65,7 +60,19 @@ step "group and directories"
 getent group reviewers >/dev/null || groupadd --system reviewers
 gid=$(getent group reviewers | cut -d: -f3)
 install -d -m 0555 -o root -g root /var/lib/reviewers /var/lib/reviewers/home
-install -d -m 0755 /etc/ssh/authorized_keys
+# Reviewers use the web page only. Earlier versions let them in by SSH: carry any not-yet-
+# activated reviewer over to the pending marker, then remove the SSH entry pieces.
+install -d -o root -g root -m 0700 /etc/brine-review/pending
+if [[ -d /etc/ssh/authorized_keys ]]; then
+  for k in /etc/ssh/authorized_keys/*.pending; do
+    [[ -f $k ]] && : > "/etc/brine-review/pending/$(basename "$k" .pending)"
+  done
+  rm -rf /etc/ssh/authorized_keys
+fi
+rm -f /usr/local/sbin/enter-review /etc/sudoers.d/reviewers
+for r in $(getent passwd | awk -F: -v g="$gid" '$4 == g {print $1}'); do
+  usermod -s /usr/sbin/nologin "$r"
+done
 install -d -m 0711 /srv/review /srv/review/homes /srv/review/originals
 install -d -m 0700 /srv/review/staging /srv/review/manifests
 install -d -m 0755 /etc/brine-review /etc/nginx/brine-users /etc/containers/systemd /etc/nftables.d
@@ -79,10 +86,8 @@ repquota -P /srv/review >/dev/null || die "project quotas are not active on /srv
 step "admin scripts"
 install -d -m 0755 /usr/local/lib/brine-review
 install -m 0644 "$src/lib/common.sh" /usr/local/lib/brine-review/common.sh
-fill "$src/sbin/enter-review" "SHELL_CMD=$shell_cmd" > /usr/local/sbin/enter-review
-chown root:root /usr/local/sbin/enter-review; chmod 0755 /usr/local/sbin/enter-review
 for s in add-reviewer load-applications unload-application activate-reviewer remove-reviewer \
-         install-image setup-data-volume review-own-home refresh-reviewer web-password; do
+         install-image setup-data-volume review-own-home refresh-reviewer web-password list-assignments; do
   install -o root -g root -m 0700 "$src/sbin/$s" "/usr/local/sbin/$s"
 done
 
@@ -120,15 +125,7 @@ nginx -t -q
 systemctl enable -q nginx
 systemctl reload-or-restart nginx
 
-step "sudoers"
-tmp=$(mktemp)
-install -m 0440 "$src/files/sudoers-reviewers" "$tmp"
-visudo -cqf "$tmp" || { rm -f "$tmp"; die "sudoers file failed visudo"; }
-mv "$tmp" /etc/sudoers.d/reviewers; chown root:root /etc/sudoers.d/reviewers
-
-step "sshd"
-grep -Eq '^[[:space:]]*Subsystem[[:space:]]+sftp[[:space:]]+/usr/lib/openssh/sftp-server' /etc/ssh/sshd_config \
-  || die "expected 'Subsystem sftp /usr/lib/openssh/sftp-server' in /etc/ssh/sshd_config"
+step "sshd: admins only (reviewers use the web page)"
 install -m 0644 "$src/files/sshd-reviewers.conf" /etc/ssh/sshd_config.d/50-reviewers.conf
 # A drop-in that fails the test must not stay behind: the next sshd restart would fail.
 sshd -t || { rm -f /etc/ssh/sshd_config.d/50-reviewers.conf; die "sshd config test failed; drop-in removed, nothing reloaded"; }

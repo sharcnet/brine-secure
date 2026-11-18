@@ -2,13 +2,13 @@
 # Acceptance tests for the grant-review VM (PRIMER.md section 11). Runs on the admin laptop.
 #
 #   ./acceptance.sh                       all safe tests
-#   ./acceptance.sh --only 1,23,28        just these
+#   ./acceptance.sh --only 1,23,51        just these
 #   ./acceptance.sh --with-resource       also 35-37 (fork bomb, memory hog, disk fill)
 #   ./acceptance.sh --with-lifecycle      also 52 and 54: REVOKES testa's key and REMOVES testa
 #
 # Before the first run:
 #   - testa, testb and testa2 added, sample.pdf and sample.txt loaded for each, and activated
-#   - their SSH private keys in test-keys/testa, test-keys/testb, test-keys/testa2 (gitignored)
+#   - WEB_PASSWORDS_FILE in review.env: "<user> <password>" lines for them (web tests 57-61)
 #   - review.env filled in and the host key pinned (review pin-hostkey)
 #   - optional: PENDING_USER=<name> of a test reviewer that is added but NOT activated (test 51)
 #
@@ -35,7 +35,6 @@ envf=${REVIEW_ENV:-$here/review.env}
 [[ -r $envf ]] || die "$envf missing"
 # shellcheck source=/dev/null
 source "$envf"
-keys=${TEST_KEYS_DIR:-$here/test-keys}
 logdir=${TEST_LOGS_DIR:-$here/test-logs}
 LOCAL_TEST=${LOCAL_TEST:-0}
 : "${VM_ADMIN:=ubuntu}" "${BRINE_URL:=https://brine.sharcnet.ca}" "${PENDING_USER:=}"
@@ -46,7 +45,6 @@ ip=${VM_HOST:-$(terraform -chdir="$here/terraform" output -raw ip 2>/dev/null)}
 [[ -n $ip ]] || die "no VM address (set VM_HOST or run review apply)"
 kh=${REVIEW_SSH_DIR:-$here/.ssh}/known_hosts
 [[ -s $kh ]] || die "host key not pinned: review pin-hostkey"
-for u in testa testb testa2; do [[ -r $keys/$u ]] || die "missing $keys/$u"; done
 
 tmp=$(mktemp -d)
 mkdir -p "$logdir"
@@ -73,29 +71,6 @@ in_ctr() {
   vm_root "podman exec -i --user reviewer -w /home/reviewer review-$1 bash -s <<'__CTR_EOF__'
 $2
 __CTR_EOF__"
-}
-
-# ssh as a test reviewer with their key: as_rv <user> [ssh options...] [-- remote command...]
-as_rv() {
-  local u=$1; shift
-  local opts=() cmd=()
-  while (( $# )); do [[ $1 == -- ]] && { shift; cmd=("$@"); break; }; opts+=("$1"); shift; done
-  ssh "${ssh_common[@]}" -o BatchMode=yes -i "$keys/$u" ${opts[@]+"${opts[@]}"} "$u@$ip" ${cmd[@]+"${cmd[@]}"}
-}
-
-# A real interactive login (through sshd, ForceCommand and enter-review). Prints only what the
-# commands print, between markers. Extra args are ssh options.
-rv_session() {
-  local u=$1 cmds=$2; shift 2
-  { printf 'PS1=; stty -echo\n'; printf 'echo "__B""EGIN__"\n%s\necho "__E""ND__"\nexit\n' "$cmds"; } \
-    | ssh "${ssh_common[@]}" -o BatchMode=yes -i "$keys/$u" -tt "$@" "$u@$ip" 2>&1 \
-    | tr -d '\r' | sed -n '/__BEGIN__$/,/__END__$/p' | sed '1d;$d'
-}
-
-sftp_batch() {   # user, batch text; runs in $tmp/dl
-  mkdir -p "$tmp/dl"
-  ( cd "$tmp/dl" && printf '%s\n' "$2" \
-      | sftp "${ssh_common[@]}" -o BatchMode=yes -i "$keys/$1" -b - "$1@$ip" 2>&1 )
 }
 
 # ---------- harness ----------
@@ -148,61 +123,42 @@ cleanup() {
     /srv/review/homes/testa/acceptance-file-canary.txt /srv/review/homes/testa/sample-out.txt \
     /srv/review/homes/*/.acceptance-whoami /srv/review/homes/testa/r /srv/review/homes/testa/b \
     /srv/review/homes/testa/ls /srv/review/homes/testa/x /srv/review/homes/testa/big; \
-    rm -rf /srv/review/homes/testa/d" >/dev/null 2>&1 || true
+    rm -rf /srv/review/homes/testa/d /var/lib/reviewers/home/.ssh" >/dev/null 2>&1 || true
   ssh -o ControlPath="$tmp/cm" -O exit x 2>/dev/null || true
   rm -rf "$tmp"
 }
 trap cleanup EXIT
 
-# ---------- 11.1 SSH entry ----------
+# ---------- 11.1 No reviewer SSH (reviewers use the web page only) ----------
 
-t1() { local o; o=$(rv_session testa 'id -un; cat ~/.acceptance-whoami; echo "ps1=$(bash -lic "echo \$PS1" 2>/dev/null </dev/null)"')
-  echo "$o"; has "$o" reviewer; check $? "id shows reviewer"
-  hasE "$o" '^testa$'; check $? "landed in testa's own home"
-  has "$o" 'review:'; check $? "review prompt"; }
+# Even with a key in place, sshd must refuse a reviewer (DenyGroups, before authentication).
+t1() { local o rc k=$tmp/rvkey
+  ssh-keygen -q -t ed25519 -N "" -C acceptance-throwaway -f "$k"
+  vm_root "install -d -m 0755 /var/lib/reviewers/home/.ssh; install -m 0644 /dev/stdin /var/lib/reviewers/home/.ssh/authorized_keys <<<'$(cat "$k.pub")'"
+  o=$(ssh "${ssh_common[@]}" -o BatchMode=yes -i "$k" "testa@$ip" true 2>&1); rc=$?
+  vm_root 'rm -rf /var/lib/reviewers/home/.ssh'
+  echo "rc=$rc $o"; [[ $rc -ne 0 ]] && has "$o" "Permission denied"; check $? "testa refused even with a planted key"
+  o=$(vm_root 'journalctl -u ssh --since "-2min" --no-pager 2>/dev/null | grep -i "testa" | tail -3'); echo "$o"
+  has "$o" DenyGroups; check $? "refused by DenyGroups"; }
 
-t2() { local o rc
-  o=$(as_rv testa -- whoami 2>&1); rc=$?; echo "whoami: rc=$rc $o"
-  [[ $rc -ne 0 ]] && has "$o" "remote commands are not allowed"; check $? "ssh whoami refused"
-  o=$(as_rv testa -tt -- bash </dev/null 2>&1 | tr -d '\r'); echo "bash: $o"
-  has "$o" "remote commands are not allowed"; check $? "ssh -t bash refused"
-  o=$(as_rv testa -s -- foo </dev/null 2>&1); rc=$?; echo "subsystem foo: rc=$rc $o"
-  [[ $rc -ne 0 ]]; check $? "ssh -s foo refused"; }
+t2() { local o; o=$(vm_root 'getent passwd testa | cut -d: -f7; passwd -S testa | cut -d" " -f2; grep -E "^[+-]:\(reviewers\)" /etc/security/access.conf 2>/dev/null || echo "access.conf not installed"')
+  echo "$o"; has "$o" /usr/sbin/nologin; check $? "no login shell"
+  hasE "$o" '^(L|NP)$'; check $? "no usable password"
+  if has "$o" "access.conf not installed"; then NOTE="pam_access is on only after configure --admin-access"
+  else has "$o" '-:(reviewers):ALL'; check $? "pam_access refuses reviewers"; fi; }
 
-t3() { local p=$((20000 + RANDOM % 20000)) pid o rc
-  as_rv testa -N -o ExitOnForwardFailure=yes -L "127.0.0.1:$p:$brine_host:443" & pid=$!
-  sleep 4; o=$(curl -sk -m5 -o /dev/null -w '%{http_code}' "https://127.0.0.1:$p/v1/models" 2>&1); kill $pid 2>/dev/null; wait $pid 2>/dev/null
-  echo "-L: $o"; [[ $o == 000 ]]; check $? "-L local forward carries nothing"
-  as_rv testa -N -o ExitOnForwardFailure=yes -D "127.0.0.1:$((p+1))" & pid=$!
-  sleep 4; o=$(curl -sk -m5 -o /dev/null -w '%{http_code}' --socks5-hostname "127.0.0.1:$((p+1))" "https://$brine_host/" 2>&1); kill $pid 2>/dev/null; wait $pid 2>/dev/null
-  echo "-D: $o"; [[ $o == 000 ]]; check $? "-D dynamic forward carries nothing"
-  o=$(as_rv testa -N -o ExitOnForwardFailure=yes -R "0:127.0.0.1:22" 2>&1 & pid=$!; sleep 6; kill $pid 2>/dev/null; wait $pid; echo "rc=$?")
-  echo "-R: $o"; ! has "$o" "rc=143"; check $? "-R remote forward refused (ssh exited by itself)"
-  o=$(as_rv testa -W "$brine_host:443" </dev/null 2>&1); rc=$?; echo "-W: rc=$rc $o"
-  [[ $rc -ne 0 ]]; check $? "-W stdio forward refused"
-  o=$(rv_session testa 'echo "display=[$DISPLAY]"' -X); echo "-X: $o"
-  has "$o" "display=[]"; check $? "-X gives no DISPLAY"
-  NOTE="-w tunnel needs local root: check by hand with sudo ssh -w any"; }
+t3() { local o; o=$(vm_root 'ls -d /usr/local/sbin/enter-review /etc/sudoers.d/reviewers /etc/ssh/authorized_keys 2>/dev/null; sudo -l -U testa 2>&1')
+  echo "$o"; ! grep -q '^/' <<<"$o"; check $? "no enter-review, reviewer sudo rule or key folder"
+  has "$o" "not allowed to run sudo"; check $? "testa has no sudo at all"; }
 
-t4() { local o; o=$(rv_session testa 'echo "sock=[$SSH_AUTH_SOCK]"; ls /tmp/ssh-* 2>/dev/null | head -1' -A)
-  echo "$o"; has "$o" "sock=[]" && ! has "$o" "/tmp/ssh-"; check $? "no agent in the container"; }
+t4() { not_local || return 3; local g o bad
+  g=$(terraform -chdir="$here/terraform" output -raw review_group_id)
+  o=$(openstack security group rule list "$g" --ingress -f value -c "IP Range" -c "Port Range"); echo "$o"
+  bad=$(awk '$2=="22:22"{print $1}' <<<"$o" | while read -r c; do [[ " $ADMIN_CIDRS " == *" $c "* ]] || echo "$c"; done)
+  [[ -z $bad ]]; check $? "port 22 open only to ADMIN_CIDRS${bad:+ (also: $bad)}"; }
 
-t5() { local o; o=$(LC_EVIL='$(id)' rv_session testa 'echo "evil=[$LC_EVIL]"' -o SendEnv=LC_EVIL)
-  echo "$o"; has "$o" "evil=[]"; check $? "client env not passed"; }
-
-t6() { local o; o=$(ssh "${ssh_common[@]}" -o BatchMode=yes -o PubkeyAuthentication=no \
-        -o PreferredAuthentications=password,keyboard-interactive "testa@$ip" true 2>&1)
-  echo "$o"; has "$o" "Permission denied (publickey)"; check $? "only publickey offered"; }
-
-t7() { local o rc; o=$(scp -O "${ssh_common[@]}" -o BatchMode=yes -i "$keys/testa" \
-        "testa@$ip:originals/sample.pdf" "$tmp/legacy.pdf" 2>&1); rc=$?
-  echo "rc=$rc $o"; [[ $rc -ne 0 && ! -s $tmp/legacy.pdf ]]; check $? "legacy scp refused"; }
-
-t8() { local o l; o=$(vm_root 'sshd -T -C user=testa,host=x,addr=203.0.113.1')
-  for l in "passwordauthentication no" "kbdinteractiveauthentication no" "permitrootlogin no" \
-           "disableforwarding yes" "allowtcpforwarding no" "allowagentforwarding no" \
-           "allowstreamlocalforwarding no" "x11forwarding no" "permittunnel no" "permituserrc no" \
-           "permituserenvironment no" "maxauthtries 3" "forcecommand sudo -n /usr/local/sbin/enter-review"; do
+t5() { local o l; o=$(vm_root 'sshd -T -C user=testa,host=x,addr=203.0.113.1')
+  for l in "denygroups reviewers" "permitrootlogin no" "permituserenvironment no" "maxauthtries 3"; do
     hasE "$o" "^$l\$"; check $? "$l"
   done; }
 
@@ -299,46 +255,11 @@ t27() { manual "brine admin: look up testa's key alias ($(vm_root "awk '\$2==\"t
 
 # ---------- 11.4 Files and tools ----------
 
-t28() { local o; rm -rf "$tmp/dl"; echo "upload test" > "$tmp/x.txt"
-  o=$(sftp_batch testa "-ls originals
--get originals/sample.pdf
--put $tmp/x.txt
--put $tmp/x.txt originals/
--mkdir d
--rm originals/sample.pdf"); echo "$o"
-  [[ -s $tmp/dl/sample.pdf ]]; check $? "download works"
-  o=$(vm_root 'ls /srv/review/homes/testa/x.txt /srv/review/originals/testa/x.txt /srv/review/homes/testa/d 2>/dev/null; [ -e /srv/review/originals/testa/sample.pdf ] && echo PDF_STILL_THERE')
-  echo "$o"; [[ $o == PDF_STILL_THERE ]]; check $? "uploads, mkdir and rm all refused"
-  rm -f "$tmp/scp.pdf"
-  scp "${ssh_common[@]}" -o BatchMode=yes -i "$keys/testa" "testa@$ip:originals/sample.pdf" "$tmp/scp.pdf" >/dev/null 2>&1
-  [[ -s $tmp/scp.pdf ]]; check $? "scp download works"
-  scp "${ssh_common[@]}" -o BatchMode=yes -i "$keys/testa" "$tmp/x.txt" "testa@$ip:" >/dev/null 2>&1
-  [[ -z $(vm_root 'ls /srv/review/homes/testa/x.txt 2>/dev/null') ]]; check $? "scp upload refused"; }
-
 t29() { local o want=${EXPECTED_FILES:-"sample.pdf sample.txt"}
   o=$(vm_root 'cd /srv/review/originals/testa && sha256sum -c /srv/review/manifests/testa.sha256 && stat -c "%U %a %n" *')
   echo "$o"; ! has "$o" FAILED && has "$o" ": OK"; check $? "checksums match the manifest"
   [[ $(grep -cE '^root 444 ' <<<"$o") -eq $(wc -w <<<"$want") ]]; check $? "root 444, exactly $(wc -w <<<"$want") files"
   for f in $want; do hasE "$o" "^root 444 $f\$"; check $? "$f present"; done; }
-
-t30() { local o; rm -rf "$tmp/dl"
-  o=$(sftp_batch testa '-cd /
--ls
--ls /home
--ls /run/brine
--get /root/*
--get /srv/review/homes/testb/*
--get /srv/review/homes/testb/.acceptance-canary.txt'); echo "$o"
-  ! has "$o" testb.conf && ! grep -rqF CANARY "$tmp/dl" 2>/dev/null; check $? "no host or testb files retrieved"; }
-
-t31() { local o; rm -rf "$tmp/dl"
-  in_ctr testa 'ln -sfn /root ~/r; ln -sfn /srv/review/homes/testb ~/b' >/dev/null
-  o=$(sftp_batch testa '-ls r
--ls b
--get -r r
--get -r b'); echo "$o"
-  ! grep -rqF CANARY "$tmp/dl" 2>/dev/null; check $? "links don't escape"
-  in_ctr testa 'rm -f ~/r ~/b' >/dev/null; }
 
 t32() { local o; o=$(in_ctr testa 'pdftotext ~/originals/sample.pdf ~/sample-out.txt && head -c 300 ~/sample-out.txt; rm -f ~/sample-out.txt')
   echo "$o"; [[ -n ${o// /} ]]; check $? "pdftotext works"; }
@@ -379,15 +300,9 @@ t37() { $with_resource || return 3; local o
 
 # ---------- 11.6 Host and network ----------
 
-t38() { local o; o=$(vm_root 'sudo -l -U testa'); echo "$o"
-  has "$o" "/usr/local/sbin/enter-review" && [[ $(grep -c 'NOPASSWD' <<<"$o") -eq 1 ]]; check $? "only enter-review"; }
-
-t39() { local o; o=$(vm_root 'stat -c "%U %a %n" /usr/local/sbin/enter-review /usr/local/sbin /usr/local /usr /usr/local/lib/brine-review/common.sh'); echo "$o"
+t39() { local o; o=$(vm_root 'stat -c "%U %a %n" /usr/local/sbin /usr/local/sbin/add-reviewer /usr/local /usr /usr/local/lib/brine-review/common.sh'); echo "$o"
   ! grep -v '^root ' <<<"$o" | grep -q .; check $? "all owned by root"
   ! awk '{m=substr($2,length($2)-1,2); if (m ~ /[2367]/) print}' <<<"$o" | grep -q .; check $? "none group- or world-writable"; }
-
-t40() { local o rc; o=$(vm_root 'sudo -u testa sudo -n /usr/local/sbin/enter-review testb 2>&1; echo rc=$?'); echo "$o"
-  ! has "$o" "rc=0"; check $? "arguments refused by sudo"; }
 
 t41() { local o; o=$(vm_root 'ls -ld /run/brine-proxy/*; ls -A /run/brine-proxy/testa; podman inspect review-testa --format "{{range .Mounts}}{{.Source}}{{println}}{{end}}" | sort')
   echo "$o"; ! grep '^d' <<<"$o" | grep -vE '^drwxr-xr-x +[0-9]+ root root ' | grep -q .; check $? "socket dirs root 0755"
@@ -410,8 +325,8 @@ t45() { local o vol; o=$(vm_root 'swapon --noheadings --show; findmnt -no OPTION
   for x in nodev nosuid noexec prjquota; do hasE "$o" "(^|,)$x(,|$)"; check $? "$x"; done
   vol=$(terraform -chdir="$here/terraform" output -raw volume_id 2>/dev/null)
   if [[ -n $vol ]] && command -v openstack >/dev/null; then
-    o=$(openstack volume show "$vol" -f value -c encrypted); echo "encrypted: $o"; [[ $o == True ]]; check $? "volume encrypted"
-  else NOTE="check by hand: openstack volume show <data-volume> -c encrypted"; fi; }
+    o=$(openstack volume show "$vol" -f value -c encrypted); echo "encrypted: $o (optional, information only)"
+  fi; }
 
 t46() { local o; o=$(vm_root 'find /var/lib/nginx/body /var/lib/nginx/proxy -type f 2>/dev/null | head'); echo "nginx temp: [$o]"
   [[ -z $o ]]; check $? "nginx temp dirs empty"
@@ -440,13 +355,13 @@ t50() { manual "brine admin: today's requests show testa's opaque key alias with
 
 t51() { local u o
   for u in testb testa2; do
-    o=$(rv_session "$u" 'cat ~/.acceptance-whoami; ls ~/originals'); echo "$u: $o"
-    [[ $(head -1 <<<"$o") == "$u" ]]; check $? "$u lands in its own container"
+    o=$(in_ctr "$u" 'cat ~/.acceptance-whoami; ls ~/originals'); echo "$u: $o"
+    [[ $(head -1 <<<"$o") == "$u" ]]; check $? "$u's container holds its own home"
   done
-  if [[ -n $PENDING_USER && -r $keys/$PENDING_USER ]]; then
-    o=$(as_rv "$PENDING_USER" -- true 2>&1); echo "$PENDING_USER: $o"
-    has "$o" "Permission denied"; check $? "not-yet-activated $PENDING_USER refused"
-  else NOTE="set PENDING_USER (added, not activated) to test refusal before activation"; fi; }
+  if [[ -n $PENDING_USER ]] && web_ready && grep -q "^$PENDING_USER " "$WEB_PASSWORDS_FILE"; then
+    o=$(wcurl "$PENDING_USER" -o /dev/null -w '%{http_code}' "$web/api/apps"); echo "$PENDING_USER web: $o"
+    [[ $o == 401 ]]; check $? "not-yet-activated $PENDING_USER refused on the web"
+  else NOTE="set PENDING_USER (added, not activated, with a line in WEB_PASSWORDS_FILE) to test refusal before activation"; fi; }
 
 t52() { $with_lifecycle || return 3; local i o
   "$here/review" revoke testa || { echo "revoke failed"; return 1; }
@@ -461,12 +376,12 @@ t53() { manual "reboot the VM (review ssh sudo reboot), then run this whole suit
 
 t54() { $with_lifecycle || return 3; local o
   echo testa | "$here/review" remove testa
-  o=$(vm_root 'id testa 2>&1; podman container exists review-testa && echo CTR; ls -d /run/brine-proxy/testa /srv/review/homes/testa /srv/review/originals/testa /srv/review/manifests/testa.sha256 /etc/nginx/brine-users/testa.conf /etc/ssh/authorized_keys/testa 2>/dev/null; true')
+  o=$(vm_root 'id testa 2>&1; podman container exists review-testa && echo CTR; ls -d /run/brine-proxy/testa /srv/review/homes/testa /srv/review/originals/testa /srv/review/manifests/testa.sha256 /etc/nginx/brine-users/testa.conf /etc/brine-review/pending/testa 2>/dev/null; grep "^testa:" /etc/brine-review/web/htpasswd; true')
   echo "$o"; has "$o" "no such user" && ! has "$o" CTR && ! grep -q '^/' <<<"$o"; check $? "testa fully removed"
-  o=$(as_rv testa -- true 2>&1); has "$o" "Permission denied"; check $? "ssh testa refused"
-  o=$(rv_session testa2 'cat ~/.acceptance-whoami'); [[ $o == testa2 ]]; check $? "testa2 still logs in (test 1)"
+  o=$(wcurl testa -o /dev/null -w '%{http_code}' "$web/api/apps"); [[ $o == 401 ]]; check $? "testa's web sign-in refused"
+  o=$(in_ctr testa2 'cat ~/.acceptance-whoami'); [[ $o == testa2 ]]; check $? "testa2's container untouched"
   o=$(in_ctr testa2 "node -e \"fetch('http://127.0.0.1:4000/v1/models').then(r=>console.log(r.status))\""); [[ $o == 200 ]]; check $? "testa2 model path (test 23)"
-  rm -rf "$tmp/dl"; sftp_batch testa2 '-get originals/sample.pdf' >/dev/null; [[ -s $tmp/dl/sample.pdf ]]; check $? "testa2 download (test 28)"; }
+  o=$(wcurl testa2 "$web/api/apps"); has "$o" '"sample.pdf"'; check $? "testa2 still signs in (test 58)"; }
 
 # ---------- 11.9 brine's shared IP and leftover connections ----------
 
@@ -552,14 +467,11 @@ t61() { web_ready || return 3; local o i
 # ---------- run ----------
 
 setup
-run 1  "ssh lands in the reviewer's container"      t1
-run 2  "remote commands and subsystems refused"     t2
-run 3  "every kind of forwarding refused"           t3
-run 4  "no agent forwarding"                        t4
-run 5  "client environment not passed"              t5
-run 6  "public key only"                            t6
-run 7  "legacy scp refused"                         t7
-run 8  "effective sshd settings for reviewers"      t8
+run 1  "reviewers refused by sshd, even with a key"  t1
+run 2  "reviewer accounts: no shell, no password, pam_access" t2
+run 3  "no SSH entry pieces left"                    t3
+run 4  "SSH port open to admin addresses only"       t4
+run 5  "effective sshd settings"                     t5
 run 9  "fail2ban sshd jail"                         t9
 run 10 "admin login only from allowlist"            t10
 run 11 "no network tools in the image"              t11
@@ -579,30 +491,25 @@ run 24 "allowlist and path tricks"                  t24
 run 25 "forged headers dropped; streaming works"    t25
 run 26 "body overrides refused"                     t26
 run 27 "key limits on brine"                        t27
-run 28 "sftp/scp download-only"                     t28
 run 29 "originals match the manifest"               t29
-run 30 "sftp sees only the container"               t30
-run 31 "links don't escape sftp"                    t31
 run 32 "pdftotext"                                  t32
 run 33 "pi answers; only allowed paths used"        t33
 run 34 "pi has no bash tool"                        t34
 run 35 "fork bomb contained"                        t35
 run 36 "memory hog contained"                       t36
 run 37 "disk quota"                                 t37
-run 38 "sudo rule"                                  t38
-run 39 "enter-review path ownership"                t39
-run 40 "enter-review takes no arguments"            t40
+run 39 "admin script path ownership"                 t39
 run 41 "socket dirs and container mounts"           t41
 run 42 "reviewer accounts have no network"          t42
 run 43 "no secrets in user data"                    t43
 run 44 "host egress locked"                         t44
-run 45 "no swap; mount options; encrypted volume"   t45
+run 45 "no swap; mount options"   t45
 run 46 "no snapshots; no nginx temp files"          t46
 run 47 "canaries through pi"                        t47
 run 48 "canaries not logged on the VM"              t48
 run 49 "canaries not logged on brine"               t49
 run 50 "brine attributes requests to the alias"     t50
-run 51 "each reviewer lands in their own container" t51
+run 51 "own container per reviewer; pending refused" t51
 run 53 "reboot"                                     t53
 run 55 "brine's shared IP"                          t55
 run 56 "lock check and open connections"            t56

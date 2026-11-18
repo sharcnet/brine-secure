@@ -1,4 +1,4 @@
-# The grant-review VM: one long-lived Ubuntu 24.04 server, an encrypted data volume, and a
+# The grant-review VM: one long-lived Ubuntu 24.04 server, a data volume, and a
 # security group whose egress is brine, DNS and the package mirror only.
 # Run from the laptop with `review` (or terraform directly). No secret goes into this state.
 terraform {
@@ -40,7 +40,7 @@ variable "key_pair" {
 
 variable "reviewer_cidrs" {
   type        = list(string)
-  description = "Addresses reviewers connect from (campus / VPN)."
+  description = "Addresses reviewers may reach the web page (443) from. Reviewers have no SSH."
 }
 
 variable "admin_cidrs" {
@@ -81,7 +81,8 @@ variable "volume_size" {
 
 variable "volume_type" {
   type        = string
-  description = "An ENCRYPTED volume type. Ceph doesn't wipe deleted volumes; deleting the key does."
+  default     = null
+  description = "Cinder volume type; null = the cloud's default. An encrypted type is optional (PRIMER §4)."
 }
 
 variable "setup_egress" {
@@ -115,12 +116,12 @@ data "openstack_images_image_v2" "ubuntu" {
 
 resource "openstack_networking_secgroup_v2" "review" {
   name                 = "${var.name}-sg"
-  description          = "SSH and HTTPS in from reviewers and admins; out only to brine, DNS, NTP and the mirror"
+  description          = "HTTPS in from reviewers and admins, SSH from admins only; out only to brine, DNS, NTP and the mirror"
   delete_default_rules = true
 }
 
 resource "openstack_networking_secgroup_rule_v2" "ssh_in" {
-  for_each          = toset(distinct(concat(var.reviewer_cidrs, var.admin_cidrs)))
+  for_each          = toset(var.admin_cidrs)  # admins only: reviewers use the web page
   security_group_id = openstack_networking_secgroup_v2.review.id
   direction         = "ingress"
   ethertype         = "IPv4"
@@ -257,6 +258,11 @@ resource "openstack_networking_floatingip_associate_v2" "review" {
 
 output "ip" {
   value = openstack_networking_floatingip_v2.review.address
+}
+
+output "fixed_ip" {
+  description = "The VM's address on the project network, used from the admin VM (VM_ADDRESS=fixed)"
+  value       = openstack_networking_port_v2.review.all_fixed_ips[0]
 }
 
 output "server_id" {

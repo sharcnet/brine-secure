@@ -54,7 +54,6 @@ BRINE_URL=https://brine.sharcnet.ca
 MODELS="North-Mini-Code-1.0"
 ADMIN_CIDRS="$subnet"
 QUOTA_GB=1
-REVIEWER_SHELL=bash
 CTR_MEMORY=1g
 CTR_CPUS=1
 CTR_PIDS=256
@@ -87,12 +86,9 @@ else
 fi
 
 step "test reviewers"
-mkdir -p "$loc/test-keys" && chmod 700 "$loc/test-keys"
 for u in testa testb testa2 testp; do
-  [[ -f $loc/test-keys/$u ]] || ssh-keygen -q -t ed25519 -N "" -C "$u-local-test" -f "$loc/test-keys/$u"
   if rv ssh "id $u" >/dev/null 2>&1; then echo "$u exists"; continue; fi
-  rv ssh "umask 077; cat > /tmp/review-$u.pub" < "$loc/test-keys/$u.pub"
-  brine_key | rv ssh "sudo -n /usr/local/sbin/add-reviewer $u /tmp/review-$u.pub gr-$(openssl rand -hex 4); rm -f /tmp/review-$u.pub"
+  brine_key | rv ssh "sudo -n /usr/local/sbin/add-reviewer $u gr-$(openssl rand -hex 4)"
 done
 
 step "applications: stage, load, check, activate"
@@ -112,15 +108,15 @@ if [[ -s $csv ]]; then
 fi
 for u in testa testb testa2; do
   echo "$u manifest: $(rv manifest "$u" | tr '\n' ' ')"
-  rv ssh "test -f /etc/ssh/authorized_keys/$u" && continue
+  rv ssh "sudo -n test -f /etc/brine-review/pending/$u" || continue
   rv activate "$u" "local test"
 done
 
-step "web sign-in passwords for the active test reviewers"
+step "web sign-in passwords for the test reviewers (testp's must not work: it's pending)"
 pwf=$loc/web-passwords.txt
 touch "$pwf"; chmod 600 "$pwf"
-for u in testa testb testa2; do
-  grep -q "^$u " "$pwf" && rv ssh "sudo -n grep -q '^$u:' /etc/brine-review/web/htpasswd" && continue
+for u in testa testb testa2 testp; do
+  grep -q "^$u " "$pwf" && rv ssh "sudo -n grep -qs '^$u:' /etc/brine-review/web/htpasswd /etc/brine-review/web/htpasswd.pending" && continue
   pw=$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)
   printf '%s\n' "$pw" | rv ssh "sudo -n /usr/local/sbin/web-password $u" >/dev/null
   { grep -v "^$u " "$pwf" || true; printf '%s %s\n' "$u" "$pw"; } > "$pwf.tmp" && mv "$pwf.tmp" "$pwf"
@@ -130,6 +126,6 @@ unset pw
 echo
 echo "Web app: https://$ip/   (self-signed certificate: accept the browser warning)"
 echo "Sign in as testa, testb or testa2. Passwords are in $pwf"
-echo "Ready. VM $ip. Reviewers log in with: ssh -i $loc/test-keys/testa -o UserKnownHostsFile=$loc/.ssh/known_hosts -o HostKeyAlias=review-vm testa@$ip"
+echo "Ready. VM $ip. Reviewers sign in at https://$ip/ (passwords in $pwf)"
 echo "Run the tests:  cd $gr && REVIEW_ENV=local/review.env ./acceptance.sh [--with-resource]"
 echo "Tear down:      $loc/down"

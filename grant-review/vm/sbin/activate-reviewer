@@ -1,8 +1,8 @@
 #!/bin/bash
 # activate-reviewer <username> <checked-by>
 #
-# Switches the reviewer's SSH login on. Run only after a second person has compared the
-# reviewer's manifest with the assignment list. <checked-by> is only a record in the log:
+# Switches the reviewer's web sign-in on. Run only after a second person has compared the reviewer's manifest with the
+# assignment list. <checked-by> is only a record in the log:
 # admins share one account on the VM, so nothing here can stop one person loading, "checking"
 # and activating alone. The check is a procedure, not a technical control.
 source /usr/local/lib/brine-review/common.sh
@@ -11,11 +11,18 @@ source /usr/local/lib/brine-review/common.sh
 u=$1 checker=$2
 need_reviewer "$u"
 [[ $checker =~ ^[A-Za-z][A-Za-z0-9._\ -]{1,60}$ ]] || die "bad checked-by name"
-[[ -f /etc/ssh/authorized_keys/$u.pending ]] || die "$u has no pending key (already active?)"
+is_pending "$u" || die "$u is not pending (already active?)"
 [[ -s $SRV/manifests/$u.sha256 ]] || die "$u has no applications loaded"
 ( cd "$SRV/originals/$u" && sha256sum --quiet -c "$SRV/manifests/$u.sha256" ) \
   || die "$u's originals no longer match the manifest"
 systemctl is-active --quiet "review-$u.service" || die "review-$u.service is not running"
 
-mv -- "/etc/ssh/authorized_keys/$u.pending" "/etc/ssh/authorized_keys/$u"
+if line=$(grep "^$u:" "$WEB_HT.pending" 2>/dev/null); then
+  tmp=$(mktemp "$WEB_HT.XXXX")
+  { grep -v "^$u:" "$WEB_HT" 2>/dev/null || true; printf '%s\n' "$line"; } > "$tmp"
+  chown root:www-data "$tmp"; chmod 0640 "$tmp"; mv "$tmp" "$WEB_HT"
+  sed -i "/^$u:/d" "$WEB_HT.pending"
+fi
+unset line
+rm -f -- "$PENDING_DIR/$u"
 log "activated $u; manifest checked by $checker"

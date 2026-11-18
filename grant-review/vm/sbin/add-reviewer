@@ -1,22 +1,18 @@
 #!/bin/bash
-# add-reviewer <username> <pubkey-file> <key-alias>   (the LiteLLM key arrives on stdin)
+# add-reviewer <username> <key-alias>   (the LiteLLM key arrives on stdin)
 #
-# Creates the account, workspace, quota, nginx socket and container. The login stays off
-# (key file ends in .pending) until activate-reviewer, after applications are loaded and
-# checked. The key is read from stdin and written with shell built-ins only, so it never
-# appears in any process's arguments.
+# Creates the account (no password, no login shell: reviewers use the web page only),
+# workspace, quota, nginx socket and container. The web sign-in stays off (the reviewer is
+# pending) until activate-reviewer, after applications are loaded and checked. The key is
+# read from stdin and written with shell built-ins only, so it never appears in any
+# process's arguments.
 source /usr/local/lib/brine-review/common.sh
 
-[[ $# -eq 3 ]] || die "usage: add-reviewer <username> <pubkey-file> <key-alias> < keyfile"
-u=$1 pub=$2 alias_id=$3
+[[ $# -eq 2 ]] || die "usage: add-reviewer <username> <key-alias> < keyfile"
+u=$1 alias_id=$2
 valid_user "$u" || die "bad username: $u"
 id "$u" &>/dev/null && die "user $u already exists"
 [[ $alias_id =~ ^gr-[0-9a-f]{8}$ ]] || die "bad key alias: $alias_id"
-[[ -f $pub ]] || die "no public key file: $pub"
-[[ $(grep -c . "$pub") -eq 1 ]] || die "$pub must hold exactly one key"
-ssh-keygen -lf "$pub" >/dev/null || die "$pub is not an SSH public key"
-grep -qE '^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa|sk-[a-z0-9@.-]+) ' "$pub" \
-  || die "$pub: options before the key type are not allowed"
 
 IFS= read -r key || [[ -n $key ]] || die "no LiteLLM key on stdin"
 key="${key//[[:space:]]/}"
@@ -24,14 +20,20 @@ key="${key//[[:space:]]/}"
 
 quota_kb=$(( QUOTA_GB * 1024 * 1024 ))
 
-useradd -g reviewers -d /var/lib/reviewers/home -M -s /bin/bash "$u"   # no password set
+useradd -g reviewers -d /var/lib/reviewers/home -M -s /usr/sbin/nologin "$u"   # no password set
 uid=$(id -u "$u")
 
-install -o root -g root -m 0644 "$pub" "/etc/ssh/authorized_keys/$u.pending"
+install -d -o root -g root -m 0700 "$PENDING_DIR"
+: > "$PENDING_DIR/$u"
 
 install -d -m 0711 "$SRV/homes/$u"
 chattr +P -p "$uid" "$SRV/homes/$u"             # [VERIFY] project quota on this kernel
 setquota -P "$uid" 0 "$quota_kb" 0 0 "$SRV"
+# The container's mount points inside the home. The runtime can't create them itself: in the
+# user namespace it has no write access to the new, root-owned home. review-own-home hands
+# them to the reviewer after the first start.
+install -d -m 0755 "$SRV/homes/$u/originals" "$SRV/homes/$u/.pi" "$SRV/homes/$u/.pi/agent"
+install -m 0600 /dev/null "$SRV/homes/$u/.pi/agent/models.json"
 install -d -o root -g root -m 0555 "$SRV/originals/$u"
 write_manifest "$u"
 

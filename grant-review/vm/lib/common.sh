@@ -22,6 +22,13 @@ valid_user() { [[ ${1:-} =~ ^[a-z][a-z0-9_-]{0,30}$ ]]; }
 valid_file() { [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$ ]]; }
 is_reviewer() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qx reviewers; }
 
+# Activation gates the web sign-in. A reviewer is pending (marker file) from add-reviewer
+# until activate-reviewer. While pending, a web password goes to htpasswd.pending, which
+# nginx never reads; activation moves it into htpasswd.
+PENDING_DIR=/etc/brine-review/pending
+WEB_HT=/etc/brine-review/web/htpasswd
+is_pending() { [[ -f $PENDING_DIR/$1 ]]; }
+
 need_reviewer() {
   valid_user "${1:-}" || die "bad username: ${1:-}"
   is_reviewer "$1" || die "$1 is not a reviewer"
