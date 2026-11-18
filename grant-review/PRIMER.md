@@ -469,22 +469,27 @@ browser ──HTTPS──► VM: nginx :443 ── sign-in (basic auth now; SSO 
     Callback: `https://<review host name>/oauth2/callback`.
   - **On the VM:** oauth2-proxy (one pinned, checksummed binary) on 127.0.0.1, with nginx
     `auth_request`. `idphint` sends reviewers straight to the Alliance login. The hint is only
-    a hint, so the server also checks it: only `eppn` ending `@<Alliance scope>` is accepted.
-    Its local part must be an *active* reviewer's name, or nginx refuses. The active list is
+    a hint, so the server also checks it: the `idp` claim must be the Alliance entityID, and
+    `eppn` must match `^[a-z][a-z0-9_-]{0,30}@alliancecan\.ca$`. Its local part must be an
+    *active* reviewer's name, or nginx refuses. The active list is
     a map file that `activate-reviewer` and `remove-reviewer` maintain, replacing
     `htpasswd`.
   - **Usernames:** reviewer names are their CCDB usernames, so no mapping table is needed.
+    **Confirmed 2026-11-18** at https://cilogon.org/testidp/: the Alliance IdP releases
+    `ePPN = <ccdb-username>@alliancecan.ca`, plus name, email and affiliation
+    (`member@alliancecan.ca`). It is R&S and SIRTFI, and its assurance is `IAP/low`.
   - **Egress:** the review VM's security group gains `cilogon.org` (443 to 75.2.49.220 and
     99.83.186.75, AWS Global Accelerator) for the token and key endpoints. Containers still have
     no network.
   - **Needs:** a DNS name and a publicly trusted certificate for the review VM (the callback
-    must be HTTPS), and the Alliance eppn format confirmed at https://cilogon.org/testidp/.
+    must be HTTPS).
   - **MFA is required (decision 2026-11-18).** The sign-in asks for it with
     `acr_values=https://refeds.org/profile/mfa`, and the server refuses any ID token whose
     `acr` claim isn't that value. With oauth2-proxy: `--oidc-groups-claim=acr` plus
-    `--allowed-group=https://refeds.org/profile/mfa`. **[VERIFY]** that the Alliance IdP
-    signals REFEDS MFA (its Duo step) through CILogon. If it doesn't, ask the Alliance, because
-    without that signal MFA can't be enforced here.
+    `--allowed-group=https://refeds.org/profile/mfa`. **Confirmed 2026-11-18:** the Alliance
+    login through CILogon asks for Duo and asserts `AuthnContextClassRef =
+    https://refeds.org/profile/mfa`. **[VERIFY]** when the client is registered that CILogon
+    passes it on as the OIDC `acr` claim, and that a sign-in without it is refused.
 - **Certificate:** `configure` makes a self-signed certificate if none exists. Replace
   `/etc/brine-review/web/tls.crt` and `tls.key` with a real one (same paths).
 
