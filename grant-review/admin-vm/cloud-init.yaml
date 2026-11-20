@@ -42,13 +42,14 @@ packages:
   - gnupg
 
 write_files:
-  # HashiCorp's apt signing key fingerprint, checked before the repo is trusted.
+  # HashiCorp's apt signing key fingerprint, checked before the repo is trusted. HashiCorp
+  # replaced its key on 2026-09-10 (old: 798AEC65...A621E701); hashicorp.com/en/trust/security.
   - path: /usr/local/sbin/install-terraform
     permissions: "0700"
     content: |
       #!/bin/bash
       set -euo pipefail
-      fpr=798AEC654E5C15428C8E42EEAA16FCBCA621E701
+      fpr=D55C0D1AC78A8D8126CB631CFC9CA96ACA026560
       t=$(mktemp)
       curl -fsSL https://apt.releases.hashicorp.com/gpg -o "$t"
       got=$(gpg --show-keys --with-colons "$t" | awk -F: '/^fpr/ {print $10; exit}')

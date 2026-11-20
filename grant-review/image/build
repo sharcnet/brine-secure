@@ -22,7 +22,7 @@ found=$(podman run --rm --network=none --entrypoint /bin/bash "$img" \
   -c 'for t in curl wget python3 git ssh apt apt-get dpkg npm npx sudo gcc; do command -v $t; done' || true)
 [[ -z $found ]] || die "image contains: $found"
 podman run --rm --network=none --entrypoint /bin/bash "$img" \
-  -c 'pi --version; pdftotext -v 2>&1 | head -1; rg --version | head -1; fd --version; node --version' \
+  -c 'pi --version 2>&1; pdftotext -v 2>&1 | head -1; rg --version | head -1; fd --version; node --version' \
   | tee "brine-review-$tag.versions"
 
 podman save -o "brine-review-$tag.tar" "$img"

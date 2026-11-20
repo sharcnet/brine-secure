@@ -3,11 +3,13 @@
 
 flavor         = "c16-32gb"              # example; about 16 vCPU / 32 GB with a root disk
 key_pair       = "admin-key"
-# volume_type  = "encrypted"             # optional; unset = the cloud default (PRIMER §4)
+# volume_type  = "CEPH-Pool-A"           # optional; unset = the cloud default (on nibi.cloud that fails: set this)
 reviewer_cidrs = ["192.0.2.0/24"]        # campus / VPN ranges
 admin_cidrs    = ["198.51.100.10/32"]    # admin VPN
 dns_cidrs      = ["192.0.2.53/32"]
-mirror_cidrs   = ["192.0.2.80/32"]       # REQUIRED: the package mirror(s) the VM updates from
-ntp_cidrs      = []                      # NTP servers, if any
+apt_mirror     = "http://mirror.csclub.uwaterloo.ca/ubuntu/"  # primary + security archive
+mirror_cidrs   = ["129.97.134.71/32"]    # REQUIRED: apt_mirror's address(es)
+ntp_servers    = ["ntp.sharcnet.ca"]     # ntp.ubuntu.com is unreachable from nibi.cloud
+ntp_cidrs      = ["199.241.162.2/32"]    # ntp_servers' addresses
 # network      = "def-sharcnet-net"
 # volume_size  = 150

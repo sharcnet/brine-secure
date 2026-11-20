@@ -1,6 +1,7 @@
 #cloud-config
 # No secrets here: user data is readable through the config drive and by anyone with a role
 # in the project. The admin key comes from the OpenStack keypair.
+# Rendered by Terraform (templatefile): apt_mirror and ntp_servers come from terraform.tfvars.
 ssh_pwauth: false
 disable_root: true
 package_update: false
@@ -9,3 +10,21 @@ swap:
 # Print host key fingerprints to the console log, where `review pin-hostkey` reads them.
 ssh_fp_console_blacklist: []
 ssh_key_console_blacklist: []
+%{ if apt_mirror != "" ~}
+# The only archive the VM may reach once egress is locked (mirror_cidrs). Security updates
+# come from the same mirror, so unattended-upgrades keeps working.
+apt:
+  primary:
+    - arches: [default]
+      uri: ${apt_mirror}
+  security:
+    - arches: [default]
+      uri: ${apt_mirror}
+%{ endif ~}
+%{ if length(ntp_servers) > 0 ~}
+# ntp_cidrs must hold these servers' addresses.
+ntp:
+  enabled: true
+  ntp_client: systemd-timesyncd
+  servers: ${jsonencode(ntp_servers)}
+%{ endif ~}

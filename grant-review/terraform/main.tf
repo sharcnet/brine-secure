@@ -74,6 +74,18 @@ variable "ntp_cidrs" {
   description = "NTP servers (UDP 123). Point systemd-timesyncd at the same ones."
 }
 
+variable "apt_mirror" {
+  type        = string
+  default     = ""
+  description = "Ubuntu archive URL for the VM (primary and security), e.g. http://mirror.csclub.uwaterloo.ca/ubuntu/. Its address goes in mirror_cidrs. Empty: the image's default (Canonical's, many changing addresses)."
+}
+
+variable "ntp_servers" {
+  type        = list(string)
+  default     = []
+  description = "NTP server names for systemd-timesyncd. Their addresses go in ntp_cidrs. Empty: ntp.ubuntu.com, which egress blocks."
+}
+
 variable "volume_size" {
   type    = number
   default = 150
@@ -121,7 +133,7 @@ resource "openstack_networking_secgroup_v2" "review" {
 }
 
 resource "openstack_networking_secgroup_rule_v2" "ssh_in" {
-  for_each          = toset(var.admin_cidrs)  # admins only: reviewers use the web page
+  for_each          = toset(var.admin_cidrs) # admins only: reviewers use the web page
   security_group_id = openstack_networking_secgroup_v2.review.id
   direction         = "ingress"
   ethertype         = "IPv4"
@@ -212,15 +224,19 @@ resource "openstack_compute_instance_v2" "review" {
   image_id     = data.openstack_images_image_v2.ubuntu.id
   flavor_name  = var.flavor
   key_pair     = var.key_pair
-  config_drive = true # cloud-init reads the config drive, so the VM never needs the metadata service
-  user_data    = file("${path.module}/cloud-init.yaml") # no secrets, ever
+  config_drive = true                                          # cloud-init reads the config drive, so the VM never needs the metadata service
+  user_data = templatefile("${path.module}/cloud-init.yaml", { # no secrets, ever
+    apt_mirror  = var.apt_mirror
+    ntp_servers = var.ntp_servers
+  })
 
   network {
     port = openstack_networking_port_v2.review.id
   }
 
   lifecycle {
-    ignore_changes = [image_id] # a newer Ubuntu image must not rebuild a VM holding data
+    # A newer Ubuntu image or edited user data must not rebuild a VM holding data.
+    ignore_changes = [image_id, user_data]
   }
 }
 
