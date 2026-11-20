@@ -1,0 +1,42 @@
+#!/bin/bash
+# remove-reviewer <username> [--purge-data]
+#
+# Removes the account, container, socket and nginx config. With --purge-data, also deletes
+# the reviewer's home, originals and manifest. Names are matched exactly, never with globs,
+# so removing testa can't touch testa2. Prints the key alias so the caller can revoke it.
+source /usr/local/lib/brine-review/common.sh
+
+[[ $# -ge 1 && $# -le 2 ]] || die "usage: remove-reviewer <username> [--purge-data]"
+u=$1 purge=false
+[[ ${2:-} == "" || ${2:-} == --purge-data ]] || die "unknown option: $2"
+[[ ${2:-} == --purge-data ]] && purge=true
+valid_user "$u" || die "bad username: $u"
+
+# Login off first, so nobody gets in while the rest is torn down.
+rm -f -- "$PENDING_DIR/$u"
+for f in "$WEB_HT" "$WEB_HT.pending"; do [[ -f $f ]] && sed -i "/^$u:/d" "$f"; done
+pkill -KILL -u "$u" 2>/dev/null || true
+
+systemctl stop "review-web@$u.service" "review-$u.service" 2>/dev/null || true
+rm -f -- "/etc/containers/systemd/review-$u.container"
+systemctl daemon-reload
+podman rm -f --ignore "review-$u" >/dev/null
+
+rm -f -- "/etc/nginx/brine-users/$u.conf"
+nginx -t -q && systemctl reload nginx
+rm -f -- "/etc/tmpfiles.d/brine-proxy-$u.conf" "/etc/tmpfiles.d/brine-review-$u.conf"
+rm -rf -- "/run/brine-proxy/$u" "/run/review-web/$u"
+
+uid=$(id -u "$u" 2>/dev/null || true)
+id "$u" &>/dev/null && userdel "$u"
+
+if $purge; then
+  rm -rf -- "$SRV/homes/$u" "$SRV/originals/$u"
+  rm -f -- "$SRV/manifests/$u.sha256"
+  [[ -n $uid ]] && setquota -P "$uid" 0 0 0 0 "$SRV"
+fi
+
+alias_id=$(awk -v u="$u" '$2 == u { print $1 }' /etc/brine-review/keys/aliases | tail -1)
+log "removed $u (purge-data: $purge, key alias: ${alias_id:-none})"
+[[ -n $alias_id ]] && echo "KEY_ALIAS=$alias_id"
+echo "Revoke the LiteLLM key on brine now."

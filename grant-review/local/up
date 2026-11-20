@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# Build the grant-review test environment on this Mac: a Lima VM standing in for the
+# OpenStack VM, the data disk, the full VM configuration, the container image (built inside
+# the VM, arm64), and four test reviewers: testa, testb, testa2 (active, sample.pdf and
+# sample.txt loaded) and testp (added, never activated).
+#
+# The test reviewers use YOUR brine key from ~/.pi/agent/models.json. It is piped to the VM,
+# never put in a command line, and LOCAL_TEST=1 stops the tooling from ever revoking it.
+# Then:  REVIEW_ENV=local/review.env ./acceptance.sh
+# Safe to run again: each step skips what already exists.
+set -euo pipefail
+loc=$(cd "$(dirname "$0")" && pwd -P)
+gr=$(cd "$loc/.." && pwd -P)
+name=grant-review
+die() { echo "error: $*" >&2; exit 1; }
+step() { echo; echo "== $*"; }
+command -v limactl >/dev/null || die "install Lima: brew install lima"
+pi_cfg=$HOME/.pi/agent/models.json
+[[ -r $pi_cfg ]] || die "no $pi_cfg (needed for a brine key)"
+brine_key() { jq -r '[.providers[] | select(.baseUrl | test("brine.sharcnet.ca")) | .apiKey][0]' "$pi_cfg"; }
+[[ $(brine_key | wc -c) -gt 10 ]] || die "no brine provider with an apiKey in $pi_cfg"
+
+step "VM"
+limactl disk list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$name-data" \
+  || limactl disk create "$name-data" --size 8GiB --format raw
+if ! limactl list -q 2>/dev/null | grep -qx "$name"; then
+  limactl create --tty=false --name "$name" "$loc/lima.yaml"
+fi
+[[ $(limactl list --format '{{.Status}}' "$name") == Running ]] || limactl start --tty=false "$name"
+vsh() { limactl shell --workdir / "$name" "$@"; }
+
+ip=$(vsh ip -4 -o addr show lima0 | awk '{print $4}' | cut -d/ -f1)
+[[ $ip =~ ^[0-9.]+$ ]] || die "no vzNAT address on lima0"
+admin=$(vsh whoami)
+subnet=${ip%.*}.0/24
+echo "VM $ip, admin user $admin"
+
+step "pin the host key (read through Lima's own channel, not trusted on first use)"
+mkdir -p "$loc/.ssh" && chmod 700 "$loc/.ssh"
+printf 'review-vm %s\n' "$(vsh cat /etc/ssh/ssh_host_ed25519_key.pub | cut -d' ' -f1-2)" > "$loc/.ssh/known_hosts"
+
+cat > "$loc/review.env" <<ENV
+# Written by local/up. The local Lima test VM, not OpenStack.
+LOCAL_TEST=1
+VM_HOST=$ip
+VM_ADMIN=$admin
+ADMIN_SSH_KEY=$HOME/.lima/_config/user
+REVIEW_SSH_DIR=$loc/.ssh
+TEST_KEYS_DIR=$loc/test-keys
+TEST_LOGS_DIR=$loc/test-logs
+PENDING_USER=testp
+WEB_PASSWORDS_FILE=$loc/web-passwords.txt
+BRINE_URL=https://brine.sharcnet.ca
+MODELS="North-Mini-Code-1.0"
+ADMIN_CIDRS="$subnet"
+QUOTA_GB=1
+CTR_MEMORY=1g
+CTR_CPUS=1
+CTR_PIDS=256
+ENV
+export REVIEW_ENV=$loc/review.env
+rv() { "$gr/review" "$@"; }
+rv ssh true || die "admin SSH to $ip failed"
+
+step "data volume"
+if rv ssh 'mountpoint -q /srv/review'; then echo "already mounted"
+else
+  dev=$(rv ssh "lsblk -dnpo NAME,TYPE,SIZE | awk '\$2==\"disk\" && \$3==\"8G\"{print \$1}'" | head -1)
+  [[ -n $dev ]] || die "can't find the 8 GiB data disk (lsblk on the VM)"
+  echo format | rv data-volume "$dev"
+fi
+
+step "configure"
+rv deploy
+
+step "container image (built inside the VM, as on first setup; rebuilt when image/ changes)"
+img_sum=$(cd "$gr/image" && find . -type f ! -name '.*' -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16)
+if [[ $(rv ssh 'sudo -n cat /root/image-src.sum 2>/dev/null') == "$img_sum" ]] && rv ssh 'sudo -n podman image exists localhost/brine-review:current'; then
+  echo "image up to date ($img_sum)"
+else
+  COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -C "$gr/image" -cf - . | rv ssh 'sudo -n rm -rf /root/image-src && sudo -n install -d -m 0700 /root/image-src && sudo -n tar --no-same-owner -C /root/image-src -xf -'
+  rv ssh "sudo -n sh -c 'cd /root && rm -f brine-review-*.tar* && LOCAL_TEST=1 bash /root/image-src/build'"
+  tar=$(rv ssh 'sudo -n sh -c "ls -t /root/brine-review-*.tar | head -1"')
+  rv ssh "sudo -n /usr/local/sbin/install-image $tar \$(sudo -n cat $tar.sha256) && echo $img_sum | sudo -n tee /root/image-src.sum >/dev/null"
+  rv ssh "sudo -n systemctl restart 'review-*.service'" || true
+fi
+
+step "test reviewers"
+for u in testa testb testa2 testp; do
+  if rv ssh "id $u" >/dev/null 2>&1; then echo "$u exists"; continue; fi
+  brine_key | rv ssh "sudo -n /usr/local/sbin/add-reviewer $u gr-$(openssl rand -hex 4)"
+done
+
+step "applications: stage, load, check, activate"
+python3 "$loc/make-sample-pdf.py" "$loc/sample.pdf"
+printf 'SAMPLE APPLICATION - TEST DATA ONLY\nAims: build river-ice sensors, predict ice jams 48 hours ahead, share open data.\n' > "$loc/sample.txt"
+csv=$loc/assignment.csv
+: > "$csv"
+for u in testa testb testa2; do
+  if [[ -n $(rv ssh "sudo -n cat /srv/review/manifests/$u.sha256") ]]; then echo "$u already loaded"; continue; fi
+  printf '%s,sample.pdf\n%s,sample.txt\n' "$u" "$u" >> "$csv"
+done
+if [[ -s $csv ]]; then
+  rv ssh 'sudo -n rm -f /srv/review/staging/sample.pdf /srv/review/staging/sample.txt'
+  rv stage "$loc/sample.pdf" "$loc/sample.txt"
+  rv load "$csv"
+  rv ssh 'sudo -n find /srv/review/staging -type f -delete'
+fi
+for u in testa testb testa2; do
+  echo "$u manifest: $(rv manifest "$u" | tr '\n' ' ')"
+  rv ssh "sudo -n test -f /etc/brine-review/pending/$u" || continue
+  rv activate "$u" "local test"
+done
+
+step "web sign-in passwords for the test reviewers (testp's must not work: it's pending)"
+pwf=$loc/web-passwords.txt
+touch "$pwf"; chmod 600 "$pwf"
+for u in testa testb testa2 testp; do
+  grep -q "^$u " "$pwf" && rv ssh "sudo -n grep -qs '^$u:' /etc/brine-review/web/htpasswd /etc/brine-review/web/htpasswd.pending" && continue
+  pw=$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)
+  printf '%s\n' "$pw" | rv ssh "sudo -n /usr/local/sbin/web-password $u" >/dev/null
+  { grep -v "^$u " "$pwf" || true; printf '%s %s\n' "$u" "$pw"; } > "$pwf.tmp" && mv "$pwf.tmp" "$pwf"
+done
+unset pw
+
+echo
+echo "Web app: https://$ip/   (self-signed certificate: accept the browser warning)"
+echo "Sign in as testa, testb or testa2. Passwords are in $pwf"
+echo "Ready. VM $ip. Reviewers sign in at https://$ip/ (passwords in $pwf)"
+echo "Run the tests:  cd $gr && REVIEW_ENV=local/review.env ./acceptance.sh [--with-resource]"
+echo "Tear down:      $loc/down"

@@ -1,0 +1,17 @@
+# The reviewer's web app, run inside their container as "reviewer" (it has no network; it
+# listens on /run/web/web.sock, which is /run/review-web/<user>/web.sock on the host).
+[Unit]
+Description=Grant review web app for %i
+BindsTo=review-%i.service
+After=review-%i.service
+# Keep retrying while the container comes back; never park the reviewer's page in "failed".
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/bin/podman exec --user reviewer -w /home/reviewer review-%i node /opt/review-web/server.js
+ExecStopPost=-/usr/bin/podman exec --user reviewer review-%i sh -c 'kill "$(cat /run/web/server.pid 2>/dev/null)" 2>/dev/null; true'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

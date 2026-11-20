@@ -1,0 +1,22 @@
+#!/bin/bash
+# install-image <image.tar> <sha256>
+#
+# Loads a container image built elsewhere (see image/build), after checking its checksum,
+# and points :current at it. Building off the VM means the VM never needs open internet
+# access once applications are on it. Running containers keep the old image until
+# restarted: systemctl restart 'review-*.service' (this drops reviewers' sessions).
+source /usr/local/lib/brine-review/common.sh
+
+[[ $# -eq 2 ]] || die "usage: install-image <image.tar> <sha256>"
+tar=$1 want=$2
+[[ -f $tar ]] || die "no such file: $tar"
+[[ $want =~ ^[0-9a-f]{64}$ ]] || die "bad sha256"
+have=$(sha256sum -- "$tar" | awk '{print $1}')
+[[ $have == "$want" ]] || die "checksum mismatch: got $have"
+
+loaded=$(podman load -i "$tar" | sed -nE 's/^Loaded image(\(s\))?: //p' | head -1)
+[[ $loaded =~ ^localhost/brine-review:[0-9]{8}(-[0-9]+)?$ ]] || die "unexpected image name: ${loaded:-none}"
+podman tag "$loaded" localhost/brine-review:current
+log "installed image $loaded (tar sha256 $have) as :current"
+echo "Restart containers in a scheduled window: systemctl restart 'review-*.service'"
+echo "Then run the whole acceptance suite again (PRIMER section 11)."

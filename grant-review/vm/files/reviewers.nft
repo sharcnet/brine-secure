@@ -1,0 +1,9 @@
+# /etc/nftables.d/reviewers.nft. configure fills in @REVIEWERS_GID@.
+# Reviewer accounts never need a network socket on the host. Drop anything they try,
+# including the cloud metadata service.
+table inet reviewer_egress {
+  chain output {
+    type filter hook output priority 0; policy accept;
+    meta skgid @REVIEWERS_GID@ counter drop
+  }
+}

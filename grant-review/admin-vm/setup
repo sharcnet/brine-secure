@@ -1,0 +1,62 @@
+#!/bin/bash
+# setup: run once as root on the admin VM, after cloning the repo to /opt/grant-review.
+# Safe to run again. See admin-vm/README.md.
+#
+# Makes the checkout shared by the gradmin group, puts the shared settings and credentials in
+# /etc/grant-review (root:gradmin, not world-readable), and gives every admin login the same
+# environment, so `review` behaves the same whoever runs it.
+set -euo pipefail
+die() { echo "error: $*" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || die "run as root (sudo)"
+getent group gradmin >/dev/null || die "no gradmin group: this is not the admin VM (see cloud-init.yaml)"
+co=/opt/grant-review
+[[ -d $co/.git && -x $co/grant-review/review ]] || die "clone the repo to $co first"
+etc=/etc/grant-review
+
+# The shared checkout: group-owned, new files group-writable (setgid dirs + umask 007 below).
+chgrp -R gradmin "$co"
+chmod -R g+rwX,o-rwx "$co"
+find "$co" -type d -exec chmod g+s {} +
+git config --system --replace-all safe.directory "$co"
+
+# Shared settings and credentials.
+install -d -o root -g gradmin -m 2750 "$etc"
+install -d -o root -g gradmin -m 2770 "$etc/ssh"          # the review VM's pinned host key
+if [[ ! -f $etc/review.env ]]; then
+  sed -e 's|^# VM_ADDRESS=fixed|VM_ADDRESS=fixed|' \
+      -e "s|^# REVIEW_SSH_DIR=.*|REVIEW_SSH_DIR=$etc/ssh|" \
+      -e "s|^LITELLM_ADMIN_HEADER=.*|LITELLM_ADMIN_HEADER=$etc/litellm-admin-header|" \
+      "$co/grant-review/review.env.example" > "$etc/review.env"
+  echo "wrote $etc/review.env from the example: fill it in (sudoedit $etc/review.env)"
+fi
+chown root:gradmin "$etc/review.env"; chmod 0660 "$etc/review.env"
+for f in clouds.yaml litellm-admin-header; do
+  [[ -f $etc/$f ]] && { chown root:gradmin "$etc/$f"; chmod 0640 "$etc/$f"; }
+done
+[[ -f $etc/clouds.yaml ]] || echo "next: put the OpenStack application credential in $etc/clouds.yaml (cloud name: openstack)"
+
+# Applications pass through here on the way to the review VM. Keep them in RAM only.
+cat > /etc/tmpfiles.d/grant-review.conf <<'EOF'
+d /run/grant-review/incoming 2770 root gradmin 1d
+EOF
+systemd-tmpfiles --create /etc/tmpfiles.d/grant-review.conf
+
+# The same environment for every admin login.
+cat > /etc/profile.d/grant-review.sh <<EOF
+if id -nG 2>/dev/null | tr ' ' '\n' | grep -qx gradmin; then
+  umask 007
+  export REVIEW_ENV=$etc/review.env
+  export OS_CLIENT_CONFIG_FILE=$etc/clouds.yaml OS_CLOUD=openstack
+  export INCOMING=/run/grant-review/incoming
+  case ":\$PATH:" in *":$co/grant-review:"*) ;; *) PATH=$co/grant-review:\$PATH ;; esac
+fi
+EOF
+chmod 0644 /etc/profile.d/grant-review.sh
+
+# Rootless podman for each admin, for image/build.
+for u in $(getent group gradmin | cut -d: -f4 | tr ',' ' '); do
+  grep -q "^$u:" /etc/subuid || echo "warning: $u has no /etc/subuid range; podman needs one (useradd normally adds it)"
+  loginctl enable-linger "$u"
+done
+
+echo "Done. Log in again so the environment applies, then: review help"

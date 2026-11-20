@@ -8,6 +8,15 @@ A disposable VM on an Alliance OpenStack cloud (Arbutus, Nibi) running the [Pi](
 exit            # VM, floating IP, and security groups are all destroyed
 ```
 
+This repo has two deployments that share one Brine dependency:
+
+- **This sandbox** (top level): one person, one throwaway VM.
+- **[grant-review/](grant-review/README.md):** about 50 reviewers in no-network containers on
+  one admin-run VM, for confidential grant review.
+
+[BRINE-REQUIREMENTS.md](BRINE-REQUIREMENTS.md) is the one list of what Brine's admins must
+set for either deployment to handle sensitive data.
+
 ## Security
 
 Run this only in an OpenStack project where you are the only member. Anyone with a role in the project can snapshot the running VM, attach their own security group to it, or open its console, and that gets them your data and your Brine key. Everything below assumes nobody else is in the project. [SECURITY-REVIEW.md](SECURITY-REVIEW.md) has the full review.

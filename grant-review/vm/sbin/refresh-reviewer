@@ -1,0 +1,25 @@
+#!/bin/bash
+# refresh-reviewer <username>|--all
+#
+# Rewrites a reviewer's units from the current templates (after configure or an upgrade of
+# this repo) and restarts their container only if its unit changed. Restarting drops that
+# reviewer's open sessions.
+source /usr/local/lib/brine-review/common.sh
+
+[[ $# -eq 1 ]] || die "usage: refresh-reviewer <username>|--all"
+if [[ $1 == --all ]]; then
+  gid=$(getent group reviewers | cut -d: -f3)
+  getent passwd | awk -F: -v g="$gid" '$4 == g { print $1 }' | while read -r u; do "$0" "$u"; done
+  exit 0
+fi
+u=$1
+need_reviewer "$u"
+changed=$(write_units "$u")
+systemctl daemon-reload
+if [[ $changed == changed ]]; then
+  systemctl restart "review-$u.service"
+  log "refreshed $u (container restarted)"
+else
+  systemctl start "review-$u.service" "review-web@$u.service"
+  echo "$u: unchanged"
+fi

@@ -1,0 +1,34 @@
+# Local test VM for grant-review: Ubuntu 24.04 on Apple Silicon (Lima, Virtualization.framework).
+# Stands in for the OpenStack VM. No host folders are mounted, no ports are forwarded, and the
+# data volume is a separate raw disk that setup-data-volume formats, like the Cinder volume.
+vmType: vz
+arch: aarch64
+cpus: 4
+memory: 4GiB
+disk: 15GiB
+images:
+  # Canonical's official image, pinned by the SHA-256 from its GPG-signed SHA256SUMS (verified
+  # 2026-11-11 with ubuntu-cloudimage-keyring, key D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81).
+  # Lima tries each location in order and rejects any file that doesn't match the digest.
+  # cloud-images.ubuntu.com was unreachable from SHARCNET's network that day, hence the mirror.
+  - location: "https://cloud-images.ubuntu.com/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: aarch64
+    digest: "sha256:50e24e1fb79e89116e939d90aa7738f7af48c442fa1bc2510131e0b39c50348e"
+  - location: "https://ftp.yz.yamagata-u.ac.jp/pub/linux/ubuntu/cloud-images/releases/noble/release-20261017/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: aarch64
+    digest: "sha256:50e24e1fb79e89116e939d90aa7738f7af48c442fa1bc2510131e0b39c50348e"
+mounts: []
+containerd:
+  system: false
+  user: false
+networks:
+  - vzNAT: true          # gives the VM an address the Mac can SSH to directly, on port 22
+additionalDisks:
+  - name: grant-review-data
+    format: false        # left raw: setup-data-volume formats it with project quotas
+ssh:
+  loadDotSSHPubKeys: false
+  forwardAgent: false
+portForwards:
+  - guestPortRange: [1, 65535]
+    ignore: true
