@@ -1,0 +1,65 @@
+#cloud-config
+# The grant-review admin VM ("command and control"). Paste this as the user data when you
+# launch the VM in Horizon (Configuration tab), after replacing the admin's name and key.
+# No secrets here: user data is readable through the metadata service and the config drive.
+#
+# What it sets up: the tools the admins need (terraform, the openstack CLI, podman for the
+# image build, git, jq, dig, poppler for merging PDFs), a gradmin group, and one named
+# account per admin. admin-vm/setup finishes the job once the repo is cloned.
+
+ssh_pwauth: false
+disable_root: true
+package_update: true
+package_upgrade: true
+
+groups:
+  - gradmin
+
+users:
+  - default
+  # One entry per admin. Their own laptop key; they make a separate key on this VM for the
+  # review VM (admin-vm/README.md).
+  - name: admin1                  # the admin's own username (e.g. their CCDB name)
+    gecos: Admin One
+    groups: [gradmin, sudo]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAA...REPLACE-WITH-THE-ADMIN-LAPTOP-PUBLIC-KEY admin1
+
+packages:
+  - git
+  - jq
+  - dnsutils
+  - podman
+  - uidmap
+  - slirp4netns
+  - poppler-utils
+  - python3-openstackclient
+  - unzip
+  - unattended-upgrades
+  - gnupg
+
+write_files:
+  # HashiCorp's apt signing key fingerprint, checked before the repo is trusted. HashiCorp
+  # replaced its key on 2026-09-10 (old: 798AEC65...A621E701); hashicorp.com/en/trust/security.
+  - path: /usr/local/sbin/install-terraform
+    permissions: "0700"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      fpr=D55C0D1AC78A8D8126CB631CFC9CA96ACA026560
+      t=$(mktemp)
+      curl -fsSL https://apt.releases.hashicorp.com/gpg -o "$t"
+      got=$(gpg --show-keys --with-colons "$t" | awk -F: '/^fpr/ {print $10; exit}')
+      [[ $got == "$fpr" ]] || { echo "HashiCorp key fingerprint mismatch: $got" >&2; exit 1; }
+      gpg --dearmor < "$t" > /usr/share/keyrings/hashicorp.gpg; rm -f "$t"
+      echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com $(. /etc/os-release; echo "$VERSION_CODENAME") main" \
+        > /etc/apt/sources.list.d/hashicorp.list
+      apt-get update -q && apt-get install -y -q terraform
+
+runcmd:
+  - /usr/local/sbin/install-terraform
+  - install -d -o root -g gradmin -m 2770 /opt/grant-review
+  - install -d -o root -g gradmin -m 2750 /etc/grant-review

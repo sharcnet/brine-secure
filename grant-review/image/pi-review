@@ -1,0 +1,3 @@
+#!/bin/bash
+# pi with file tools only: no bash tool. [VERIFY] the flag and tool names with `pi --help`.
+exec /usr/local/bin/pi --tools read,write,edit,grep,find,ls "$@"

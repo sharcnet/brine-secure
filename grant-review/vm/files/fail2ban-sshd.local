@@ -1,0 +1,12 @@
+# /etc/fail2ban/jail.d/sshd.local. configure fills in the admin addresses so admins can't ban
+# themselves.
+[sshd]
+enabled = true
+ignoreip = 127.0.0.1/8 ::1 @ADMIN_CIDRS@
+
+# Failed web sign-ins (nginx basic auth).
+[nginx-http-auth]
+enabled = true
+port    = https
+logpath = /var/log/nginx/error.log
+ignoreip = 127.0.0.1/8 ::1 @ADMIN_CIDRS@

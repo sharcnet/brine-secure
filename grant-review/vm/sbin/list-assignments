@@ -1,0 +1,72 @@
+#!/bin/bash
+# list-assignments [applications|reviewers|csv]
+#
+# Read-only report of who has which application, built from what is actually on the VM:
+# the files in /srv/review/originals/<user>/, the reviewer accounts, and their login state.
+#   applications (default)  each application and the reviewers who have it
+#   reviewers               each reviewer: status, web sign-in, container, manifest, applications
+#   csv                     username,filename,status lines, the same shape as an assignment list,
+#                           so it can be compared with the competition owner's list (diff/sort)
+# Never opens an application: it reads names, and checksums only to compare with the manifest.
+source /usr/local/lib/brine-review/common.sh
+
+mode=${1:-applications}
+[[ $mode =~ ^(applications|reviewers|csv)$ ]] || die "usage: list-assignments [applications|reviewers|csv]"
+
+gid=$(getent group reviewers | cut -d: -f3) || die "no reviewers group"
+
+# Reviewers have reviewers as their primary group, so getent group doesn't list them.
+mapfile -t users < <(getent passwd | awk -F: -v g="$gid" '$4 == g {print $1}' | sort)
+
+status_of() { if is_pending "$1"; then echo pending; else echo active; fi; }
+
+apps_of() {
+  local f
+  for f in "$SRV/originals/$1"/*; do [[ -f $f ]] && echo "${f##*/}"; done
+  true
+}
+
+declare -A status
+for u in "${users[@]}"; do status[$u]=$(status_of "$u"); done
+
+case $mode in
+  csv)
+    for u in "${users[@]}"; do
+      while IFS= read -r f; do [[ -n $f ]] && printf '%s,%s,%s\n' "$u" "$f" "${status[$u]}"; done < <(apps_of "$u")
+    done ;;
+
+  reviewers)
+    printf '%-20s %-8s %-4s %-9s %-9s %s\n' REVIEWER STATUS WEB CONTAINER MANIFEST APPLICATIONS
+    for u in "${users[@]}"; do
+      web=no; grep -qs "^$u:" "$WEB_HT" "$WEB_HT.pending" && web=yes
+      ctr=down; systemctl is-active --quiet "review-$u.service" && ctr=up
+      mapfile -t apps < <(apps_of "$u")
+      if (( ${#apps[@]} == 0 )); then man=-
+      elif [[ $(grep -c . "$SRV/manifests/$u.sha256" 2>/dev/null) == "${#apps[@]}" ]] &&
+           ( cd "$SRV/originals/$u" && sha256sum --quiet --status -c "$SRV/manifests/$u.sha256" ) 2>/dev/null; then man=ok
+      else man=MISMATCH; fi
+      printf '%-20s %-8s %-4s %-9s %-9s %s\n' "$u" "${status[$u]}" "$web" "$ctr" "$man" \
+        "$( (( ${#apps[@]} )) && printf '%s ' "${apps[@]}" || echo '(none)')"
+    done
+    echo
+    echo "${#users[@]} reviewer(s)" ;;
+
+  applications)
+    declare -A who
+    for u in "${users[@]}"; do
+      while IFS= read -r f; do
+        [[ -n $f ]] && who[$f]+="$u(${status[$u]}) "
+      done < <(apps_of "$u")
+    done
+    printf '%-40s %s\n' APPLICATION REVIEWERS
+    if (( ${#who[@]} )); then
+      while IFS= read -r f; do printf '%-40s %s\n' "$f" "${who[$f]}"; done < <(printf '%s\n' "${!who[@]}" | sort)
+    fi
+    echo
+    echo "${#who[@]} application(s), ${#users[@]} reviewer(s)"
+    none=(); for u in "${users[@]}"; do [[ -n $(apps_of "$u") ]] || none+=("$u"); done
+    (( ${#none[@]} )) && echo "reviewers with no applications: ${none[*]}"
+    mapfile -t staged < <(find "$SRV/staging" -maxdepth 1 -type f ! -name '.*' -printf '%f\n' 2>/dev/null | sort)
+    (( ${#staged[@]} )) && echo "staged but not loaded: ${staged[*]}"
+    true ;;
+esac

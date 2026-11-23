@@ -1,0 +1,18 @@
+#!/bin/bash
+# unload-application <username> <filename>
+#
+# For a conflict of interest declared during the review: removes one application from the
+# reviewer's originals and regenerates their manifest. Notes the reviewer made about it are
+# in their home; ask the competition owner whether those go too.
+source /usr/local/lib/brine-review/common.sh
+
+[[ $# -eq 2 ]] || die "usage: unload-application <username> <filename>"
+u=$1 f=$2
+need_reviewer "$u"
+valid_file "$f" || die "bad filename: $f"
+target=$SRV/originals/$u/$f
+[[ -f $target && ! -L $target ]] || die "$f is not loaded for $u"
+
+rm -f -- "$target"
+write_manifest "$u"
+log "removed $f from $u"

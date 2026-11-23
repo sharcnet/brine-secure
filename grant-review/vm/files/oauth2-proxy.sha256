@@ -1,0 +1,7 @@
+# oauth2-proxy release tarballs that `review deploy` may install (WEB_AUTH=sso). The project
+# publishes SHA-256 files but no signatures, so these pins are the trust anchor: they were
+# checked against the release's own sha256sum files on 2026-11-20. To upgrade, change the
+# version line and both hashes together, and read the release notes.
+# version 7.15.6
+91b3e86d9c2de679a516e6696704e3fd1acf67e8b8f7be77b618f086f72fb1f0  oauth2-proxy-v7.15.6.linux-amd64.tar.gz
+3593e50daa517eaa8f8d0966b95786a61a4cdf491694dc9091b8cd32daa85d56  oauth2-proxy-v7.15.6.linux-arm64.tar.gz
