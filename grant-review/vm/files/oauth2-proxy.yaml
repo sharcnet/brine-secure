@@ -1,0 +1,41 @@
+# /etc/brine-review/sso/oauth2-proxy.yaml (alpha config; configure fills in @NAME@).
+# oauth2-proxy checks the sign-in (PKCE, nonce, the ID token's signature and audience), asks
+# for MFA, refuses any ID token whose acr isn't MFA, and allows only the active reviewers'
+# eppns. review-authz then checks the IdP, the MFA claim and the eppn again from the ID token
+# before nginx picks a reviewer's socket.
+server:
+  bindAddress: 127.0.0.1:4180
+upstreamConfig:
+  upstreams:
+    - id: authonly
+      path: /
+      static: true
+      staticCode: 202
+injectResponseHeaders:
+  # Read by review-authz on loopback only; nginx never passes these to a browser or container.
+  - name: X-Auth-Request-Email
+    values: [{claimSource: {claim: email}}]
+  - name: X-Auth-Request-Id-Token
+    values: [{claimSource: {claim: id_token}}]
+providers:
+  - id: cilogon
+    provider: oidc
+    clientID: "@SSO_CLIENT_ID@"
+    clientSecretFile: /etc/brine-review/sso/client-secret
+    scope: "openid email profile org.cilogon.userinfo"
+    code_challenge_method: S256
+    # MFA: the sign-in asks for it, and any ID token without it is refused.
+    allowedGroups: ["@SSO_MFA@"]
+    oidcConfig:
+      issuerURL: "@SSO_ISSUER@"
+      emailClaim: eppn
+      groupsClaim: acr
+      userIDClaim: eppn
+      insecureAllowUnverifiedEmail: true   # eppn is an identifier, not a mailbox
+      insecureSkipNonce: false
+      audienceClaims: [aud]
+    loginURLParameters:
+      - name: acr_values
+        default: ["@SSO_MFA@"]
+      - name: idphint
+        default: ["@SSO_IDP@"]

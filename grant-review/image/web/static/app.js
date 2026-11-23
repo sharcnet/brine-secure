@@ -14,6 +14,8 @@ async function api(path, opts) {
     o.body = JSON.stringify(o.body);
   }
   const r = await fetch(path, o);
+  // Signed out (session expired or ended): reload, so the sign-in page takes over.
+  if (r.status === 401) { location.reload(); return new Promise(() => {}); }
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `request failed (${r.status})`);
   return data;

@@ -5,15 +5,15 @@
       "api": "openai-completions",
       "apiKey": "injected-by-proxy",
       "models": [
-        { "id": "North-Mini-Code-1.0", "name": "North Mini Code 1.0", "reasoning": false, "input": ["text"],
-          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-          "contextWindow": 320000, "maxTokens": 8192 },
         { "id": "Qwen3.8-27B", "name": "Qwen3.8 27B", "reasoning": false, "input": ["text"],
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
           "contextWindow": 131072, "maxTokens": 8192 },
         { "id": "DeepSeek-V4-Flash-0731", "name": "DeepSeek V4 Flash", "reasoning": false, "input": ["text"],
           "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-          "contextWindow": 131072, "maxTokens": 8192 }
+          "contextWindow": 131072, "maxTokens": 8192 },
+        { "id": "North-Mini-Code-1.0", "name": "North Mini Code 1.0", "reasoning": false, "input": ["text"],
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "contextWindow": 320000, "maxTokens": 8192 }
       ]
     }
   }

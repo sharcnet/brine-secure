@@ -86,6 +86,24 @@ variable "ntp_servers" {
   description = "NTP server names for systemd-timesyncd. Their addresses go in ntp_cidrs. Empty: ntp.ubuntu.com, which egress blocks."
 }
 
+variable "sso_cidrs" {
+  type        = list(string)
+  default     = ["75.2.49.220/32", "99.83.186.75/32"]
+  description = "The identity provider's addresses (TCP 443) for oauth2-proxy's token and key requests: cilogon.org, AWS Global Accelerator (static). Empty: no SSO egress. Must match SSO_CIDRS in review.env."
+}
+
+variable "root_ssh_cidrs" {
+  type        = list(string)
+  default     = []
+  description = "Addresses root may log in from by SSH key (ROOT_SSH_CIDRS in review.env, which also carries the keys). Only the ones not already in admin_cidrs or cert_push_cidrs get a rule here. Empty: none."
+}
+
+variable "cert_push_cidrs" {
+  type        = list(string)
+  default     = []
+  description = "Hosts that push the web certificate over SSH to the certpush account (forced command: install-web-cert only), e.g. the Ansible host. Must match CERT_PUSH_CIDRS in review.env. Empty: no such rule."
+}
+
 variable "volume_size" {
   type    = number
   default = 150
@@ -128,12 +146,38 @@ data "openstack_images_image_v2" "ubuntu" {
 
 resource "openstack_networking_secgroup_v2" "review" {
   name                 = "${var.name}-sg"
-  description          = "HTTPS in from reviewers and admins, SSH from admins only; out only to brine, DNS, NTP and the mirror"
+  description          = "HTTPS in from reviewers and admins, SSH from admins only; out only to brine, DNS, NTP, the mirror and the identity provider"
   delete_default_rules = true
 }
 
 resource "openstack_networking_secgroup_rule_v2" "ssh_in" {
   for_each          = toset(var.admin_cidrs) # admins only: reviewers use the web page
+  security_group_id = openstack_networking_secgroup_v2.review.id
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 22
+  port_range_max    = 22
+  remote_ip_prefix  = each.value
+}
+
+# The certificate pusher (e.g. Ansible) gets the certpush account: sshd forces install-web-cert
+# for it. If the same address is also in root_ssh_cidrs, root may log in from it too, by key.
+resource "openstack_networking_secgroup_rule_v2" "cert_push_in" {
+  for_each          = toset(var.cert_push_cidrs)
+  security_group_id = openstack_networking_secgroup_v2.review.id
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 22
+  port_range_max    = 22
+  remote_ip_prefix  = each.value
+}
+
+# Root by SSH key (named admins), for the addresses not already open above. sshd's Match, the
+# keys' from= and pam_access limit root to these addresses too.
+resource "openstack_networking_secgroup_rule_v2" "root_ssh_in" {
+  for_each          = toset(setsubtract(var.root_ssh_cidrs, concat(var.admin_cidrs, var.cert_push_cidrs)))
   security_group_id = openstack_networking_secgroup_v2.review.id
   direction         = "ingress"
   ethertype         = "IPv4"
@@ -198,6 +242,17 @@ resource "openstack_networking_secgroup_rule_v2" "ntp_out" {
   remote_ip_prefix  = each.value
 }
 
+resource "openstack_networking_secgroup_rule_v2" "sso_out" {
+  for_each          = toset(var.sso_cidrs)
+  security_group_id = openstack_networking_secgroup_v2.review.id
+  direction         = "egress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 443
+  port_range_max    = 443
+  remote_ip_prefix  = each.value
+}
+
 resource "openstack_networking_secgroup_v2" "setup" {
   name                 = "${var.name}-setup"
   description          = "Open egress for first setup only, before any application is loaded"
@@ -259,6 +314,7 @@ resource "openstack_networking_floatingip_v2" "review" {
   pool = data.openstack_networking_network_v2.public.name
 
   lifecycle {
+    prevent_destroy = true # the site's DNS A record and CILogon callback point at this address
     precondition {
       condition     = data.openstack_networking_router_v2.project.external_network_id == data.openstack_networking_network_v2.public.id
       error_message = "Router '${data.openstack_networking_router_v2.project.name}' has no gateway to '${data.openstack_networking_network_v2.public.name}'. Fix once per project: openstack router set --external-gateway ${data.openstack_networking_network_v2.public.name} ${data.openstack_networking_router_v2.project.name}"

@@ -1,0 +1,43 @@
+# /etc/systemd/system/oauth2-proxy.service (WEB_AUTH=sso). configure fills in @SSO_ALLOW@.
+[Unit]
+Description=oauth2-proxy for the grant-review web sign-in (CILogon)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=oauth2-proxy
+Group=oauth2-proxy
+ExecStart=/usr/local/bin/oauth2-proxy --config /etc/brine-review/sso/oauth2-proxy.cfg --alpha-config /etc/brine-review/sso/oauth2-proxy.yaml
+Restart=on-failure
+RestartSec=5
+# Network: loopback (nginx, review-authz, the local resolver) and the identity provider only.
+IPAddressDeny=any
+IPAddressAllow=localhost @SSO_ALLOW@
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

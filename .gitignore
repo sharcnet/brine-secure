@@ -21,3 +21,5 @@ grant-review/local/test-logs/
 grant-review/local/sample.*
 grant-review/local/assignment.csv
 grant-review/local/web-passwords.txt
+grant-review/.cache/
+grant-review/local/sso-client-secret

@@ -68,6 +68,23 @@ Then follow the main [README](../README.md) from `terraform init`, on this VM. `
 runs here too: it is x86_64 with podman. The review VM never needs `setup-egress on` for the
 image again.
 
+## Root by SSH key (2026-11-23)
+
+Two named admins (the deployment lead and the sysadmin who installs the web certificate) may
+log in as root with their keys, which cloud-init's `disable_root` would otherwise block. It's done by hand, since
+cloud-init runs once:
+
+- `/root/.ssh/authorized_keys` (0600): their two keys, each with
+  `from="<addresses>",no-agent-forwarding,no-X11-forwarding`.
+- `/etc/ssh/sshd_config.d/55-root.conf`: `PermitRootLogin no`, then
+  `Match User root Address <addresses>` with `PermitRootLogin prohibit-password` and
+  `AuthenticationMethods publickey`.
+- Security group `gr-admin`: port 22 from the same addresses (the lead's home address and the
+  SHARCNET Ansible host).
+
+Check with `sudo sshd -T -C user=root,host=x,addr=<address>`. The review VM does the same through
+`ROOT_SSH_KEYS` / `ROOT_SSH_CIDRS` in review.env (PRIMER §8).
+
 ## Day to day
 
 ```bash

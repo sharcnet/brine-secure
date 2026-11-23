@@ -39,6 +39,8 @@ step "pin the host key (read through Lima's own channel, not trusted on first us
 mkdir -p "$loc/.ssh" && chmod 700 "$loc/.ssh"
 printf 'review-vm %s\n' "$(vsh cat /etc/ssh/ssh_host_ed25519_key.pub | cut -d' ' -f1-2)" > "$loc/.ssh/known_hosts"
 
+# A throwaway key for the certificate push account (test 68 pushes with it).
+[[ -f $loc/test-keys/certpush ]] || { mkdir -p "$loc/test-keys"; ssh-keygen -q -t ed25519 -N '' -C certpush-test -f "$loc/test-keys/certpush"; }
 cat > "$loc/review.env" <<ENV
 # Written by local/up. The local Lima test VM, not OpenStack.
 LOCAL_TEST=1
@@ -57,6 +59,9 @@ QUOTA_GB=1
 CTR_MEMORY=1g
 CTR_CPUS=1
 CTR_PIDS=256
+CERT_PUSH_KEY='$(cat "$loc/test-keys/certpush.pub")'
+CERT_PUSH_CIDRS=${ip%.*}.1/32
+CERT_PUSH_TEST_KEY=$loc/test-keys/certpush
 ENV
 export REVIEW_ENV=$loc/review.env
 rv() { "$gr/review" "$@"; }

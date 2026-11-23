@@ -2,14 +2,14 @@
 
 A second deployment of Pi + Brine, for confidential grant review. Reviewers share one
 long-lived VM, each with their own Podman container that has no network at all. Reviewers
-use a **web page** only (their applications, the original or its text, an assistant panel,
+sign in with their Alliance account and MFA through CILogon, and use a **web page** only (their applications, the original or its text, an assistant panel,
 and their notes), served from inside their own container. They have no SSH access.
 The only way out is a Unix socket to nginx on the host, which adds that reviewer's Brine key
 and forwards two exact API paths to Brine. Admins pre-load each reviewer's assigned
 applications as read-only files. Reviewers can download their notes but never upload.
 
 [PRIMER.md](PRIMER.md) is the design: what each piece does and why, what still needs
-verifying, the 53 acceptance tests, and operations. Start there. A security sign-off write-up
+verifying, the 60 acceptance tests, and operations. Start there. A security sign-off write-up
 with a diagram and threat model exists as a separate document (ask the grant-review admins).
 
 ## How it differs from the sandbox
@@ -31,12 +31,13 @@ Brine's admins must set, and the findings in [`../SECURITY-REVIEW.md`](../SECURI
 ```
 admin-vm/              the command-and-control VM: cloud-init, setup, README
 review                 admin CLI (admin VM or laptop); reads review.env
-acceptance.sh          the 53 acceptance tests; logs to test-logs/
+acceptance.sh          the 60 acceptance tests; logs to test-logs/
 review.env.example
 terraform/             VM, data volume, security groups, floating IP
 image/                 container image: Containerfile, lockfile, forwarder, build script
 image/web/             the reviewers' web app (Node built-ins only), served from inside each container
-local/                 a Lima test VM for a Mac: local/up builds everything, see local/README.md
+local/                 a Lima test VM for a Mac: local/up builds everything, see local/README.md;
+                       local/sso on|off switches it to CILogon sign-in against a mock provider
 vm/configure           sets up the VM (run by `review deploy`)
 vm/sbin/               enter-review and the admin scripts
 vm/lib/common.sh       shared helpers for the admin scripts
@@ -67,6 +68,25 @@ image/build                         # on the admin VM (x86_64 + podman)
 ./review setup-egress off           # and never on again
 ```
 
+Sign-in. Run `./acceptance.sh` once in basic mode first (below), then switch to CILogon:
+
+```bash
+# No passwords stay with a CILogon site. First remove the test reviewers (their names could
+# be real Alliance usernames; configure refuses sso while they exist) and the password file:
+for t in testa testb testa2 testp; do ./review remove $t; done
+rm -P test-keys/web-passwords.txt
+# review.env: WEB_AUTH=sso, SSO_HOST=<dns name>, SSO_CLIENT_ID=<cilogon:/client_id/...>
+./review web-cert fullchain.pem privkey.pem   # a trusted certificate for SSO_HOST, or let
+                                    # Ansible push it: CERT_PUSH_KEY/CIDRS (PRIMER §8.1)
+./review deploy                     # fetches oauth2-proxy (pinned SHA-256); deletes the password files
+./review sso-secret clientsecret.txt  # 0600 file, or omit the file to type it
+./acceptance.sh --only 62,63,64,65,66,67
+```
+
+Register the CILogon client at https://cilogon.org/oauth2/register: confidential client,
+callback `https://<SSO_HOST>/oauth2/callback`, scopes `openid email profile
+org.cilogon.userinfo`. PRIMER §8.1 has the details.
+
 Then add three test reviewers (`testa`, `testb`, `testa2`) with `sample.pdf` and
 `sample.txt`, and run `./acceptance.sh` (PRIMER §11) before any real reviewer.
 
@@ -78,7 +98,7 @@ Per reviewer:
 ./review load assignment.csv        # username,filename
 ./review manifest alice             # a second person checks this against the list
 ./review activate alice "J. Smith"
-./review web-password alice         # prints a new web sign-in password once
+./review web-password alice         # basic mode only: prints a new web sign-in password once
 ./review list                       # each application and its reviewers (also: reviewers, csv)
 ./review remove alice               # purge data, revoke key (asks you to type the name)
 ```

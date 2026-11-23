@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# local/sso on|off : switch the local Lima test VM between basic auth and SSO, with a mock
+# OIDC provider (local/mock-oidc.py) standing in for CILogon. Test only: the mock signs in
+# whoever the test harness names. Never point a real VM at it.
+#
+#   local/sso on     start the mock on the VM (192.168.64.2:9000), set WEB_AUTH=sso in
+#                    local/review.env, deploy, install the mock's client secret
+#   local/sso off    back to WEB_AUTH=basic, stop the mock
+set -euo pipefail
+loc=$(cd "$(dirname "$0")" && pwd -P); gr=$(cd "$loc/.." && pwd -P)
+env=$loc/review.env vm=grant-review ip=192.168.64.2
+[[ -f $env ]] || { echo "run local/up first" >&2; exit 1; }
+sh() { limactl shell "$vm" sudo bash -c "$1"; }
+
+set_env() {  # replace the block between the markers in local/review.env
+  sed -i '' '/^# --- sso (local\/sso) ---$/,/^# --- end sso ---$/d' "$env"
+  printf '%s\n' "# --- sso (local/sso) ---" "$@" "# --- end sso ---" >> "$env"
+}
+
+case ${1:-} in
+  on)
+    sec=$loc/sso-client-secret
+    cid="cilogon:oa4mp,2012:/client_id/local-test"   # CILogon-shaped: a comma and colons, like the real one
+    [[ -f $sec ]] || ( umask 077; openssl rand -hex 24 > "$sec" )
+    limactl copy "$loc/mock-oidc.py" "$vm:/tmp/mock-oidc.py"
+    limactl copy "$sec" "$vm:/tmp/mock-oidc-secret"
+    sh "set -e
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -q python3-jwt python3-cryptography >/dev/null
+      install -d -m 0700 /opt/mock-oidc
+      install -m 0644 /tmp/mock-oidc.py /opt/mock-oidc/mock-oidc.py
+      install -m 0600 /tmp/mock-oidc-secret /opt/mock-oidc/secret; rm -f /tmp/mock-oidc.py /tmp/mock-oidc-secret
+      systemctl stop mock-oidc 2>/dev/null || true; systemctl reset-failed mock-oidc 2>/dev/null || true
+      systemd-run --unit=mock-oidc --collect /usr/bin/python3 /opt/mock-oidc/mock-oidc.py \
+        --issuer http://$ip:9000 --listen $ip:9000 --client-id \"$cid\" \
+        --client-secret-file /opt/mock-oidc/secret --ttl \${MOCK_TTL:-900}
+      sleep 1; systemctl is-active mock-oidc"
+    set_env "WEB_AUTH=sso" "SSO_HOST=$ip" "SSO_CLIENT_ID=$cid" "SSO_ISSUER=http://$ip:9000" \
+            "SSO_CIDRS=$ip/32" "MOCK_OIDC=http://$ip:9000"
+    cd "$gr"
+    REVIEW_ENV=$env ./review deploy
+    REVIEW_ENV=$env ./review sso-secret "$sec"
+    echo "SSO on (mock provider at http://$ip:9000). Tests: REVIEW_ENV=local/review.env ./acceptance.sh" ;;
+  off)
+    set_env "WEB_AUTH=basic"
+    cd "$gr"; REVIEW_ENV=$env ./review deploy
+    sh "systemctl stop mock-oidc 2>/dev/null || true"
+    echo "SSO off (basic auth)" ;;
+  *) echo "usage: local/sso on|off" >&2; exit 1 ;;
+esac

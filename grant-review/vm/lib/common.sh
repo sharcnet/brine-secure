@@ -29,6 +29,30 @@ PENDING_DIR=/etc/brine-review/pending
 WEB_HT=/etc/brine-review/web/htpasswd
 is_pending() { [[ -f $PENDING_DIR/$1 ]]; }
 
+# Who may sign in to the web page: every reviewer who isn't pending. Derived from that state
+# each time, never edited line by line, and written three ways (atomically):
+#   active        names, one per line           review-authz (WEB_AUTH=sso)
+#   active.map    "name name;" lines            nginx, for both sign-in modes
+#   active-emails name@SSO_DOMAIN lines         oauth2-proxy, which watches it (WEB_AUTH=sso)
+# Then nginx reloads. Usage: write_web_access [<name-to-leave-out>]
+WEB_DIR=/etc/brine-review/web
+write_web_access() {
+  local skip=${1:-} gid r names=() t
+  gid=$(getent group reviewers | cut -d: -f3) || die "no reviewers group"
+  while IFS= read -r r; do
+    valid_user "$r" && [[ $r != "$skip" ]] && ! is_pending "$r" && names+=("$r")
+  done < <(getent passwd | awk -F: -v g="$gid" '$4 == g {print $1}' | sort)
+  install -d -m 0755 "$WEB_DIR"
+  t=$(mktemp "$WEB_DIR/.active.XXXX"); printf '%s\n' "${names[@]}" | sed '/^$/d' > "$t"
+  chmod 0644 "$t"; mv "$t" "$WEB_DIR/active"
+  t=$(mktemp "$WEB_DIR/.map.XXXX"); for r in "${names[@]}"; do printf '%s %s;\n' "$r" "$r"; done > "$t"
+  chmod 0644 "$t"; mv "$t" "$WEB_DIR/active.map"
+  t=$(mktemp "$WEB_DIR/.emails.XXXX"); for r in "${names[@]}"; do printf '%s@%s\n' "$r" "${SSO_DOMAIN:-alliancecan.ca}"; done > "$t"
+  if getent group oauth2-proxy >/dev/null; then chown root:oauth2-proxy "$t"; chmod 0640 "$t"; else chmod 0600 "$t"; fi
+  mv "$t" "$WEB_DIR/active-emails"
+  if systemctl is-active --quiet nginx; then nginx -t -q && systemctl reload nginx; fi
+}
+
 need_reviewer() {
   valid_user "${1:-}" || die "bad username: ${1:-}"
   is_reviewer "$1" || die "$1 is not a reviewer"

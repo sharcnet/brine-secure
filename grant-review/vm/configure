@@ -28,6 +28,42 @@ done
 [[ $ADMIN_CIDRS =~ ^[0-9a-fA-F.:/\ ]+$ ]] || die "bad ADMIN_CIDRS"
 [[ $QUOTA_GB =~ ^[0-9]+$ && $CTR_CPUS =~ ^[0-9.]+$ && $CTR_PIDS =~ ^[0-9]+$ ]] || die "bad limits"
 [[ $CTR_MEMORY =~ ^[0-9]+[kmg]$ ]] || die "bad CTR_MEMORY"
+WEB_AUTH=${WEB_AUTH:-basic}
+[[ $WEB_AUTH == basic || $WEB_AUTH == sso ]] || die "WEB_AUTH must be basic or sso"
+if [[ $WEB_AUTH == sso ]]; then
+  for v in SSO_HOST SSO_CLIENT_ID SSO_ISSUER SSO_IDP SSO_MFA SSO_DOMAIN SSO_CIDRS; do
+    [[ -n ${!v:-} ]] || die "review.conf: $v is not set (needed for WEB_AUTH=sso)"
+  done
+  [[ $SSO_HOST =~ ^[A-Za-z0-9.-]+$ ]] || die "bad SSO_HOST"
+  [[ $SSO_CLIENT_ID =~ ^[A-Za-z0-9:/.,_-]+$ ]] || die "bad SSO_CLIENT_ID"   # CILogon: cilogon:oa4mp,2012:/client_id/<hex>
+  [[ $SSO_ISSUER =~ ^https?://[A-Za-z0-9.:/_-]+$ ]] || die "bad SSO_ISSUER"
+  [[ $SSO_IDP =~ ^https://[A-Za-z0-9.:/_-]+$ && $SSO_MFA =~ ^https://[A-Za-z0-9.:/_-]+$ ]] || die "bad SSO_IDP or SSO_MFA"
+  [[ $SSO_DOMAIN =~ ^[a-z0-9.-]+$ ]] || die "bad SSO_DOMAIN"
+  [[ $SSO_CIDRS =~ ^[0-9a-fA-F.:/\ ]+$ ]] || die "bad SSO_CIDRS"
+fi
+
+# Optional certificate pusher (e.g. the Ansible host): one key, from CERT_PUSH_CIDRS only,
+# that can run install-web-cert and nothing else. The installer checks the host, so SSO_HOST
+# must be set even before the sign-in switches to sso.
+CERT_PUSH_KEY=${CERT_PUSH_KEY:-} CERT_PUSH_CIDRS=${CERT_PUSH_CIDRS:-}
+if [[ -n $CERT_PUSH_KEY ]]; then
+  key_re='^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+=* ?[A-Za-z0-9@._-]*$'
+  [[ $CERT_PUSH_KEY =~ $key_re ]] || die "bad CERT_PUSH_KEY (one public key line: type, key, optional comment)"
+  [[ $CERT_PUSH_CIDRS =~ ^[0-9a-fA-F.:/]+(\ [0-9a-fA-F.:/]+)*$ ]] || die "CERT_PUSH_KEY needs CERT_PUSH_CIDRS (the pusher's addresses)"
+  [[ ${SSO_HOST:-} =~ ^[A-Za-z0-9.-]+$ ]] || die "CERT_PUSH_KEY needs SSO_HOST: pushed certificates are checked against it"
+fi
+
+# Optional root login by SSH key (decision 2026-11-23: two named admins, for the web
+# certificate and break-glass). Keys only, only from ROOT_SSH_CIDRS: sshd's Match, from= on every key,
+# pam_access and the security group each enforce the addresses. Empty: root can't log in.
+ROOT_SSH_KEYS=${ROOT_SSH_KEYS:-} ROOT_SSH_CIDRS=${ROOT_SSH_CIDRS:-}
+if [[ -n $ROOT_SSH_KEYS ]]; then
+  key_re='^(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+=* ?[A-Za-z0-9@._-]*$'
+  while IFS= read -r k; do
+    [[ -z $k || $k =~ $key_re ]] || die "bad ROOT_SSH_KEYS line (one public key per line: type, key, optional comment): ${k:0:40}"
+  done <<<"$ROOT_SSH_KEYS"
+  [[ $ROOT_SSH_CIDRS =~ ^[0-9a-fA-F.:/]+(\ [0-9a-fA-F.:/]+)*$ ]] || die "ROOT_SSH_KEYS needs ROOT_SSH_CIDRS (where root may log in from)"
+fi
 
 # The data volume comes first (setup-data-volume): everything confidential lives on it.
 mountpoint -q /srv/review || die "/srv/review is not mounted; run setup-data-volume first"
@@ -87,11 +123,15 @@ step "admin scripts"
 install -d -m 0755 /usr/local/lib/brine-review
 install -m 0644 "$src/lib/common.sh" /usr/local/lib/brine-review/common.sh
 for s in add-reviewer load-applications unload-application activate-reviewer remove-reviewer \
-         install-image setup-data-volume review-own-home refresh-reviewer web-password list-assignments; do
+         install-image setup-data-volume review-own-home refresh-reviewer web-password list-assignments \
+         web-access-sync install-sso-secret install-web-cert; do
   install -o root -g root -m 0700 "$src/sbin/$s" "/usr/local/sbin/$s"
 done
 
 step "pi config and container template"
+# Containers bind-mount this file, so they keep the old copy until they restart.
+models_changed=0
+cmp -s "$src/files/models.json" /etc/brine-review/models.json || models_changed=1
 install -m 0644 "$src/files/models.json" /etc/brine-review/models.json
 jq -e '.providers.brine.apiKey == "injected-by-proxy"' /etc/brine-review/models.json >/dev/null \
   || die "models.json must hold the dummy key only"
@@ -111,15 +151,79 @@ if [[ ! -s /etc/brine-review/web/tls.crt ]]; then
   chmod 0600 /etc/brine-review/web/tls.key
   echo "self-signed web certificate for $san"
 fi
-[[ -f /etc/brine-review/web/htpasswd ]] || install -m 0640 -o root -g www-data /dev/null /etc/brine-review/web/htpasswd
+# Passwords exist only in basic mode. With CILogon the VM holds no web password at all, so
+# switching to sso deletes both files (basic mode starts again from empty ones).
+if [[ $WEB_AUTH == basic ]]; then
+  [[ -f /etc/brine-review/web/htpasswd ]] || install -m 0640 -o root -g www-data /dev/null /etc/brine-review/web/htpasswd
+else
+  # The acceptance accounts are ordinary names in the Alliance namespace: in sso mode a real
+  # Alliance user called testa would get testa's sandbox. The local Lima VM needs them.
+  if [[ ${LOCAL_TEST:-0} != 1 ]]; then
+    for t in testa testb testa2 testp; do
+      ! id "$t" >/dev/null 2>&1 || die "test reviewer $t still exists; remove the test reviewers (review remove $t) before WEB_AUTH=sso"
+    done
+  fi
+  for f in /etc/brine-review/web/htpasswd /etc/brine-review/web/htpasswd.pending; do
+    if [[ -e $f ]]; then shred -u "$f" 2>/dev/null || rm -f "$f"; echo "removed $f (no passwords with CILogon)"; fi
+  done
+fi
 install -m 0644 "$src/files/review-web@.service" /etc/systemd/system/review-web@.service
 systemctl daemon-reload
+
+step "web sign-in: $WEB_AUTH"
+for svc in oauth2-proxy review-authz; do
+  getent passwd "$svc" >/dev/null || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$svc"
+done
+install -m 0644 "$src/files/review-authz.py" /usr/local/lib/brine-review/review-authz.py
+# The active list exists in every mode: nginx's map includes it.
+/usr/local/sbin/web-access-sync
+if [[ $WEB_AUTH == sso ]]; then
+  # oauth2-proxy: the tarball `review deploy` fetched, checked here again against the pins.
+  arch=$(dpkg --print-architecture)
+  tgz=$(awk -v a="linux-$arch.tar.gz" '$2 ~ a"$" {print $2}' "$src/files/oauth2-proxy.sha256")
+  want=$(awk -v f="$tgz" '$2 == f {print $1}' "$src/files/oauth2-proxy.sha256")
+  if [[ -f $src/$tgz ]]; then
+    [[ $(sha256sum "$src/$tgz" | cut -d' ' -f1) == "$want" ]] || die "$tgz does not match its pinned SHA-256"
+    t=$(mktemp -d); tar -C "$t" -xzf "$src/$tgz"
+    install -o root -g root -m 0755 "$t/${tgz%.tar.gz}/oauth2-proxy" /usr/local/bin/oauth2-proxy
+    rm -rf "$t"
+  fi
+  [[ -x /usr/local/bin/oauth2-proxy ]] || die "oauth2-proxy is not installed (review deploy fetches it when WEB_AUTH=sso)"
+  /usr/local/bin/oauth2-proxy --version
+  d=/etc/brine-review/sso
+  install -d -m 0750 -o root -g oauth2-proxy "$d"
+  if [[ ! -s $d/cookie-secret ]]; then
+    ( umask 077; openssl rand -base64 32 | tr -d '\n' | tr '+/' '-_' > "$d/cookie-secret" )
+  fi
+  chown root:oauth2-proxy "$d/cookie-secret"; chmod 0640 "$d/cookie-secret"
+  fill "$src/files/oauth2-proxy.cfg" "SSO_HOST=$SSO_HOST" > "$d/oauth2-proxy.cfg"
+  fill "$src/files/oauth2-proxy.yaml" "SSO_CLIENT_ID=$SSO_CLIENT_ID" "SSO_ISSUER=$SSO_ISSUER" \
+    "SSO_IDP=$SSO_IDP" "SSO_MFA=$SSO_MFA" > "$d/oauth2-proxy.yaml"
+  chown root:oauth2-proxy "$d/oauth2-proxy.cfg" "$d/oauth2-proxy.yaml"; chmod 0640 "$d/oauth2-proxy.cfg" "$d/oauth2-proxy.yaml"
+  printf 'SSO_IDP=%s\nSSO_MFA=%s\nSSO_DOMAIN=%s\n' "$SSO_IDP" "$SSO_MFA" "$SSO_DOMAIN" > "$d/authz.env"
+  chmod 0644 "$d/authz.env"
+  fill "$src/files/oauth2-proxy.service" "SSO_ALLOW=$SSO_CIDRS" > /etc/systemd/system/oauth2-proxy.service
+  install -m 0644 "$src/files/review-authz.service" /etc/systemd/system/review-authz.service
+  systemctl daemon-reload
+  systemctl enable -q review-authz; systemctl restart review-authz
+  if [[ -s $d/client-secret ]]; then
+    systemctl enable -q oauth2-proxy; systemctl restart oauth2-proxy
+  else
+    systemctl disable -q --now oauth2-proxy 2>/dev/null || true
+    echo "oauth2-proxy waits for the client secret: review sso-secret (sign-in fails closed until then)"
+  fi
+else
+  # Basic auth: the SSO services are off.
+  systemctl disable -q --now oauth2-proxy review-authz 2>/dev/null || true
+fi
 
 step "nginx (brine sockets per reviewer; HTTPS :443 for the web app only)"
 rm -f /etc/nginx/sites-enabled/default
 fill "$src/files/brine-proxy.conf" "BRINE_HOST=$BRINE_HOST" > /etc/nginx/snippets/brine-proxy.conf
 install -m 0644 "$src/files/nginx-brine.conf" /etc/nginx/conf.d/brine.conf
 install -m 0644 "$src/files/nginx-web.conf" /etc/nginx/conf.d/review-web.conf
+install -m 0644 "$src/files/review-web-proxy.conf" /etc/nginx/snippets/review-web-proxy.conf
+install -m 0644 "$src/files/review-web-auth-$WEB_AUTH.conf" /etc/nginx/review-web-auth.conf
 install -m 0600 "$src/files/nginx-user.conf.tmpl" /etc/brine-review/nginx-user.conf.tmpl
 nginx -t -q
 systemctl enable -q nginx
@@ -130,6 +234,54 @@ install -m 0644 "$src/files/sshd-reviewers.conf" /etc/ssh/sshd_config.d/50-revie
 # A drop-in that fails the test must not stay behind: the next sshd restart would fail.
 sshd -t || { rm -f /etc/ssh/sshd_config.d/50-reviewers.conf; die "sshd config test failed; drop-in removed, nothing reloaded"; }
 systemctl try-reload-or-restart ssh      # 24.04 socket-activates sshd; idle means next start reads it
+
+if [[ -n $ROOT_SSH_KEYS ]]; then step "root: SSH key login from $ROOT_SSH_CIDRS"
+else step "root: no SSH login"; fi
+rt_conf=/etc/ssh/sshd_config.d/55-root.conf rt_keys=/root/.ssh/authorized_keys
+install -d -m 0700 -o root -g root /root/.ssh
+if [[ -n $ROOT_SSH_KEYS ]]; then
+  rt_first=${ROOT_SSH_CIDRS%%[/ ]*}
+  grep -v '^$' <<<"$ROOT_SSH_KEYS" | sed "s|^|from=\"${ROOT_SSH_CIDRS// /,}\",no-agent-forwarding,no-X11-forwarding |" > "$rt_keys.tmp"
+  chown root:root "$rt_keys.tmp"; chmod 0600 "$rt_keys.tmp"; mv "$rt_keys.tmp" "$rt_keys"
+  fill "$src/files/sshd-root.conf" "ROOT_SSH_CIDRS=${ROOT_SSH_CIDRS// /,}" > "$rt_conf"
+  sshd -t || { rm -f "$rt_conf"; die "sshd config test failed with the root block; removed"; }
+  # Keys only from ROOT_SSH_CIDRS; still no root login from anywhere else.
+  [[ $(sshd -T -C user=root,host=x,addr=$rt_first | awk '$1=="permitrootlogin"{print $2}') == without-password ]] \
+    || { rm -f "$rt_conf"; die "sshd doesn't allow root by key from $rt_first; removed"; }
+  [[ $(sshd -T -C user=root,host=x,addr=203.0.113.1 | awk '$1=="permitrootlogin"{print $2}') == no ]] \
+    || { rm -f "$rt_conf"; die "the root Match block reaches other addresses; removed"; }
+else
+  rm -f "$rt_conf"; : > "$rt_keys"; chmod 0600 "$rt_keys"
+fi
+
+if [[ -n $CERT_PUSH_KEY ]]; then step "certificate push account: certpush from $CERT_PUSH_CIDRS"
+else step "certificate push account: none"; fi
+cp_conf=/etc/ssh/sshd_config.d/60-certpush.conf cp_keys=/etc/ssh/certpush_authorized_keys cp_sudo=/etc/sudoers.d/certpush
+if [[ -n $CERT_PUSH_KEY ]]; then
+  # Home /: sshd needs a directory to start the forced command in, and certpush owns nothing.
+  getent passwd certpush >/dev/null \
+    || useradd --system --no-create-home --home-dir / --shell /bin/sh certpush
+  usermod -d / certpush
+  ! id -nG certpush | tr ' ' '\n' | grep -qx reviewers || die "certpush must not be in the reviewers group"
+  printf 'certpush ALL=(root) NOPASSWD: /usr/local/sbin/install-web-cert ""\n' > "$cp_sudo.tmp"
+  chmod 0440 "$cp_sudo.tmp"
+  visudo -cqf "$cp_sudo.tmp" || { rm -f "$cp_sudo.tmp"; die "certpush sudoers rule failed visudo"; }
+  mv "$cp_sudo.tmp" "$cp_sudo"
+  printf 'from="%s",restrict,command="sudo -n /usr/local/sbin/install-web-cert" %s\n' \
+    "${CERT_PUSH_CIDRS// /,}" "$CERT_PUSH_KEY" > "$cp_keys.tmp"
+  chown root:root "$cp_keys.tmp"; chmod 0644 "$cp_keys.tmp"; mv "$cp_keys.tmp" "$cp_keys"
+  install -m 0644 "$src/files/sshd-certpush.conf" "$cp_conf"
+  sshd -t || { rm -f "$cp_conf"; die "sshd config test failed with the certpush block; removed"; }
+  # The Match block must not reach anyone else.
+  [[ $(sshd -T -C user=certpush,host=x,addr=${CERT_PUSH_CIDRS%%[/ ]*} | awk '$1=="forcecommand"{print $2,$3,$4}') == "sudo -n /usr/local/sbin/install-web-cert" ]] \
+    || { rm -f "$cp_conf"; die "sshd doesn't force install-web-cert for certpush; removed"; }
+  [[ $(sshd -T -C user=someone-else,host=x,addr=${CERT_PUSH_CIDRS%%[/ ]*} | awk '$1=="forcecommand"{print $2}') == none ]] \
+    || { rm -f "$cp_conf"; die "the certpush Match block leaks to other users; removed"; }
+else
+  rm -f "$cp_conf" "$cp_keys" "$cp_sudo"
+  ! getent passwd certpush >/dev/null || userdel certpush
+fi
+systemctl try-reload-or-restart ssh
 
 step "nftables: drop all network traffic from the reviewers group"
 fill "$src/files/reviewers.nft" "REVIEWERS_GID=$gid" > /etc/nftables.d/reviewers.nft
@@ -149,7 +301,13 @@ if $admin_access; then
   step "pam_access: admins only from $ADMIN_CIDRS (keep another session open)"
   grep -Eq '^account[[:space:]]+required[[:space:]]+pam_access\.so' /etc/pam.d/sshd \
     || printf 'account required pam_access.so\n' >> /etc/pam.d/sshd
-  fill "$src/files/access.conf" "ADMIN_CIDRS=$ADMIN_CIDRS" > /etc/security/access.conf
+  fill "$src/files/access.conf" "ADMIN_CIDRS=$ADMIN_CIDRS" \
+    | if [[ -n $CERT_PUSH_KEY ]]; then
+        awk -v l="+:certpush:$CERT_PUSH_CIDRS" '$0=="-:ALL:ALL"{print l} {print}'
+      else cat; fi \
+    | if [[ -n $ROOT_SSH_KEYS ]]; then
+        awk -v l="+:root:$ROOT_SSH_CIDRS" '$0=="-:ALL:ALL"{print l} {print}'
+      else cat; fi > /etc/security/access.conf
   echo "Now open a NEW admin SSH session before closing this one."
 fi
 
@@ -158,6 +316,15 @@ findmnt /srv/review
 ports=$(ss -ltnpH | awk '/nginx/ {n=split($4,a,":"); print a[n]}' | sort -u | tr '\n' ' ')
 [[ $ports == "443 " ]] || die "nginx listens on TCP ports other than 443: $ports"
 echo "nginx: TCP 443 only"
+# Public listeners: SSH and HTTPS only (plus the mock identity provider on the local test VM).
+allow=':(22|443)$'; [[ ${LOCAL_TEST:-0} == 1 ]] && allow=':(22|443|9000)$'
+bad=$(ss -ltnH | awk '{print $4}' | grep -vE '^(127\.[0-9.]+(%[a-z0-9]+)?|\[::1\]):[0-9]+$' | grep -vE "$allow" || true)
+[[ -z $bad ]] || die "unexpected TCP listeners: $bad"
+if [[ $WEB_AUTH == sso ]]; then
+  systemctl is-active --quiet review-authz || die "review-authz is not running"
+  systemctl is-active --quiet oauth2-proxy && echo "oauth2-proxy: running on 127.0.0.1:4180" \
+    || echo "oauth2-proxy: not running yet (review sso-secret)"
+fi
 for _ in $(seq 1 20); do fail2ban-client ping >/dev/null 2>&1 && break; sleep 0.5; done
 fail2ban-client status sshd | head -3
 podman image exists localhost/brine-review:current \
@@ -168,5 +335,9 @@ if podman image exists localhost/brine-review:current; then
   /usr/local/sbin/refresh-reviewer --all
 else
   echo "no image yet; skipped"
+fi
+if (( models_changed )) && compgen -G "/etc/containers/systemd/review-*.container" >/dev/null; then
+  echo "The model list changed. Running containers keep the old one until they restart:"
+  echo "  systemctl restart 'review-*.service'   (in a quiet moment: it ends open chats)"
 fi
 echo "Done."

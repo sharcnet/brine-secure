@@ -1,7 +1,7 @@
 #!/bin/bash
 # activate-reviewer <username> <checked-by>
 #
-# Switches the reviewer's web sign-in on. Run only after a second person has compared the reviewer's manifest with the
+# Switches the reviewer's web sign-in on (the active list, and with WEB_AUTH=basic their password). Run only after a second person has compared the reviewer's manifest with the
 # assignment list. <checked-by> is only a record in the log:
 # admins share one account on the VM, so nothing here can stop one person loading, "checking"
 # and activating alone. The check is a procedure, not a technical control.
@@ -25,4 +25,5 @@ if line=$(grep "^$u:" "$WEB_HT.pending" 2>/dev/null); then
 fi
 unset line
 rm -f -- "$PENDING_DIR/$u"
+write_web_access
 log "activated $u; manifest checked by $checker"

@@ -13,3 +13,7 @@ ntp_servers    = ["ntp.sharcnet.ca"]     # ntp.ubuntu.com is unreachable from ni
 ntp_cidrs      = ["199.241.162.2/32"]    # ntp_servers' addresses
 # network      = "def-sharcnet-net"
 # volume_size  = 150
+# sso_cidrs    = ["75.2.49.220/32", "99.83.186.75/32"]  # default: cilogon.org (WEB_AUTH=sso)
+# sso_cidrs    = ["3.33.212.95/32", "15.197.204.227/32"] # test.cilogon.org instead
+# cert_push_cidrs = ["198.51.100.7/32"]   # optional: a host that pushes the web certificate (certpush account, install-web-cert only)
+# root_ssh_cidrs  = ["198.51.100.10/32"]  # optional: where root may log in from by key (ROOT_SSH_KEYS/ROOT_SSH_CIDRS in review.env)

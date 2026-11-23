@@ -1,0 +1,43 @@
+# /etc/systemd/system/review-authz.service (WEB_AUTH=sso): the identity checks nginx runs
+# before every reviewer request. See /usr/local/lib/brine-review/review-authz.py.
+[Unit]
+Description=grant-review sign-in checks (IdP, MFA, active reviewer)
+After=network.target oauth2-proxy.service
+
+[Service]
+User=review-authz
+Group=review-authz
+EnvironmentFile=/etc/brine-review/sso/authz.env
+ExecStart=/usr/bin/python3 -I /usr/local/lib/brine-review/review-authz.py
+Restart=on-failure
+RestartSec=2
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictAddressFamilies=AF_INET AF_INET6
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

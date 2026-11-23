@@ -21,6 +21,18 @@ grant-review/local/down      # delete the VM and its data disk
   re-pin through Lima's own channel:
   `printf 'review-vm %s\n' "$(limactl shell grant-review cat /etc/ssh/ssh_host_ed25519_key.pub | cut -d' ' -f1-2)" > local/.ssh/known_hosts`
 
+CILogon sign-in, against a mock provider (`local/mock-oidc.py`, never used on a real VM):
+
+```bash
+grant-review/local/sso on    # mock on 192.168.64.2:9000, WEB_AUTH=sso, deploy, client secret
+cd grant-review && REVIEW_ENV=local/review.env ./acceptance.sh   # web tests sign in via the mock
+grant-review/local/sso off   # back to basic auth
+```
+
+The mock signs in whoever the test queues (`POST /test/next` with the claims), so tests 64-65
+can try the wrong IdP, a missing MFA claim and so on. Its client secret is in
+`local/sso-client-secret` (gitignored).
+
 How it differs from OpenStack:
 
 | | OpenStack | Local |

@@ -18,7 +18,11 @@ what to verify, and holds the acceptance tests.
 >   `DisableForwarding`, and admin SSH limited to allowlisted addresses (pam_access).
 > - A list of the settings brine needs, now shared as `../BRINE-REQUIREMENTS.md`.
 > - §11 grew from 22 to 61 tests, including a canary test for content logging. (53 since the
->   web-only change of 2026-11-18.)
+>   web-only change of 2026-11-18; 59 with the CILogon tests of 2026-11-20; 60 with the
+>   certificate push test.)
+>
+> **Revision 2026-11-20:** CILogon sign-in built (§8.1): oauth2-proxy plus `review-authz`,
+> `WEB_AUTH=sso|basic`, tests 62-67, and a mock OIDC provider for the local test VM.
 >
 > **Revision 2026-11-10b:** moved into `sharcnet/brine-secure` as a second deployment. The
 > inline code became real files (`review`, `terraform/`, `image/`, `vm/`). Findings from
@@ -247,7 +251,9 @@ Secrets never sit in this repo, in Terraform state, in user data or in a command
     before deleting it, and that is best effort (old copies can survive in Ceph until reused).
     If a competition owner needs guaranteed destruction, set an encrypted `volume_type`; then
     deleting its key in Barbican destroys the data.
-- **Floating IP**, with the same router-gateway check as the sandbox.
+- **Floating IP**, with the same router-gateway check as the sandbox. It has `prevent_destroy`:
+  the site's DNS A record points at it, so rebuilding the VM keeps the address. Releasing it
+  takes removing that line on purpose (retention step 4).
 
 ```bash
 cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # fill in
@@ -390,6 +396,11 @@ pieces from a VM that had them.
 
 - **sshd:** `DenyGroups reviewers`, refused before authentication. `MaxAuthTries 3` and
   `PermitRootLogin no` globally. Admins only.
+- **Root by SSH key (decision 2026-11-23):** Two named admins (the deployment lead and the sysadmin who
+  installs the web certificate) may log in as root with their keys (`ROOT_SSH_KEYS`). Only from
+  `ROOT_SSH_CIDRS`: a `Match User root Address` block (`55-root.conf`, `prohibit-password`,
+  publickey only), `from=` on every key, a `+:root:` pam_access line, and `root_ssh_cidrs` in
+  the security group. Everywhere else root stays refused (test 5 and 69).
 - **Security group:** port 22 accepts only `admin_cidrs`; `reviewer_cidrs` reach 443 only.
 - **pam_access:** `-:(reviewers):ALL`, so a reviewer account can't log in from anywhere, even
   if sshd were misconfigured.
@@ -412,8 +423,8 @@ Reviewers sign in at `https://<VM>/` and get a three-panel page:
 Notes and conversations download as Markdown.
 
 ```
-browser ──HTTPS──► VM: nginx :443 ── sign-in (basic auth now; SSO later, see below)
-                        │ $remote_user → /run/review-web/<user>/web.sock   (only that one)
+browser ──HTTPS──► VM: nginx :443 ── sign-in: CILogon (WEB_AUTH=sso) or basic auth (tests)
+                        │ active name → /run/review-web/<user>/web.sock   (only that one)
                         ▼
                   container review-<user> (network=none):
                     node /opt/review-web/server.js  (as "reviewer", Unix socket only)
@@ -427,8 +438,21 @@ browser ──HTTPS──► VM: nginx :443 ── sign-in (basic auth now; SSO 
   - It reaches brine through the same forwarder as SSH sessions.
   - `review-web@<user>.service` starts it with `podman exec` once the container is up.
 - **Sign-in and routing:**
-  - nginx (`vm/files/nginx-web.conf`) serves TLS on 443 and checks the password against
-    `/etc/brine-review/web/htpasswd`, set with `review web-password <user>`.
+  - nginx (`vm/files/nginx-web.conf`) serves TLS on 443. The sign-in itself is in
+    `/etc/nginx/review-web-auth.conf`, which `configure` installs for `WEB_AUTH`: **`sso`**
+    (CILogon, below; for reviewers) or **`basic`** (a password per reviewer, set with
+    `review web-password <user>`; for the local test VM and the first acceptance run).
+  - **No passwords with CILogon (2026-11-20).** Switching to `sso` deletes `htpasswd` and
+    `htpasswd.pending`, and `web-password` refuses to run, so a CILogon site holds no web
+    password. On a real VM `configure` also refuses `sso` while the acceptance accounts
+    (`testa`, `testb`, `testa2`, `testp`) exist: they are ordinary names in the Alliance
+    namespace, so a real Alliance user with one of them would get that sandbox. Remove them
+    after the basic-mode run. Test 63 checks no password file is left.
+  - **The active list (2026-11-20).** In both modes the signed-in name must be on
+    `/etc/brine-review/web/active.map` before nginx picks a socket. `web-access-sync` writes
+    it, with `active` (for review-authz) and `active-emails` (for oauth2-proxy), from every
+    reviewer who isn't pending. It is derived from that state each time, never edited line by
+    line. `activate-reviewer` and `remove-reviewer` call it.
   - **Activation gates the web too (fixed 2026-11-18).** Until then, a reviewer with a web
     password could sign in before the second-person check. Now a pending reviewer's password
     goes to `htpasswd.pending`, which nginx never reads, and `activate-reviewer` moves it
@@ -458,40 +482,114 @@ browser ──HTTPS──► VM: nginx :443 ── sign-in (basic auth now; SSO 
   - Application names must match the loader's strict pattern.
   - Notes are never written through a symlink.
 - **Not in the web page:** uploads, sharing, a shell, other users' anything.
-- **SSO: CILogon (chosen 2026-11-18) [OPEN, not built yet].** Basic auth with per-reviewer
-  passwords is for the pilot. For the competition, reviewers sign in through
-  [CILogon](https://www.cilogon.org/oidc) with their Alliance (CCDB) account, the same login and
-  MFA as CCDB. The Alliance IdP `https://idp.alliancecan.ca/idp/shibboleth` is in CILogon's list
-  and releases the R&S attributes. The plan:
+- **SSO: CILogon (chosen 2026-11-18, built 2026-11-20).** Reviewers sign in through
+  [CILogon](https://www.cilogon.org/oidc) with their Alliance (CCDB) account and MFA, the same
+  login as CCDB. The Alliance IdP `https://idp.alliancecan.ca/idp/shibboleth` is in CILogon's
+  list and releases the R&S attributes.
+
+  ```
+  browser ─► nginx :443 ─ /oauth2/* ──────────────► oauth2-proxy 127.0.0.1:4180 ─► CILogon
+               │                                       (PKCE, nonce, ID token signature,
+               │                                        acr = MFA, active eppns only)
+               └ every other request: auth_request ─► review-authz 127.0.0.1:4181
+                    ▲ 202 + X-Review-User: <name>        │ asks oauth2-proxy for the session,
+                    │   (or 401 → sign-in, 403)           │ then checks the ID token itself:
+                    └─ name on active.map → that socket   │ idp, acr, eppn, active list
+  ```
+
   - **Client:** a confidential OIDC client registered at https://cilogon.org/oauth2/register.
-    It's free for academic research (Basic tier) and approved by hand, about a day. Scopes:
-    `openid email profile org.cilogon.userinfo` (the last one carries `eppn` and `idp`).
-    Callback: `https://<review host name>/oauth2/callback`.
-  - **On the VM:** oauth2-proxy (one pinned, checksummed binary) on 127.0.0.1, with nginx
-    `auth_request`. `idphint` sends reviewers straight to the Alliance login. The hint is only
-    a hint, so the server also checks it: the `idp` claim must be the Alliance entityID, and
-    `eppn` must match `^[a-z][a-z0-9_-]{0,30}@alliancecan\.ca$`. Its local part must be an
-    *active* reviewer's name, or nginx refuses. The active list is
-    a map file that `activate-reviewer` and `remove-reviewer` maintain, replacing
-    `htpasswd`.
+    Free for academic research (Basic tier), approved by hand in about a day. Scopes:
+    `openid email profile org.cilogon.userinfo` (the last carries `eppn` and `idp`).
+    Callback: `https://<SSO_HOST>/oauth2/callback`. `SSO_CLIENT_ID` goes in review.env; the
+    secret goes to the VM with `review sso-secret` (a 0600 file, or typed), never in the repo
+    or user data.
+  - **oauth2-proxy** (`vm/files/oauth2-proxy.*`): v7.15.6, fetched by `review deploy` and
+    checked against the SHA-256 pins in `vm/files/oauth2-proxy.sha256`, on the admin machine
+    and again on the VM. The project publishes no signatures, so the pins are the trust
+    anchor; upgrade by changing the version and both hashes together. It runs as its own
+    user, loopback only, with systemd sandboxing and `IPAddressAllow=localhost` plus
+    `SSO_CIDRS` (CILogon) only. It does the OIDC flow (PKCE S256, nonce checked), sends
+    `acr_values=https://refeds.org/profile/mfa` and `idphint=<Alliance IdP>`, refuses any ID
+    token whose `acr` isn't MFA (`groupsClaim: acr` plus `allowedGroups`), and allows only the
+    eppns in `active-emails`, which it watches: taking a reviewer off the list ends their
+    session on the next request (test 65). Sessions are encrypted cookies
+    (`__Host-review_sso`, Secure, HttpOnly, SameSite=Lax) that last 12 hours, whatever the
+    ID token's lifetime. Request logging is off, because URLs carry application names.
+  - **review-authz** (`vm/files/review-authz.py`, Python standard library, about 100 lines):
+    the second, independent check, and the only one nginx trusts for the name. oauth2-proxy
+    can't check arbitrary claims (it maps only email, groups and user), so review-authz asks
+    it for the session over loopback, reads the ID token oauth2-proxy verified at sign-in,
+    and checks that `idp` is the Alliance IdP (`idphint` is only a hint), that `acr` is MFA,
+    that `eppn` matches `^[a-z][a-z0-9_-]{0,30}@alliancecan\.ca$` and equals the session's
+    email, and that the name is on the active list. Any error is a refusal. It runs as its
+    own user, loopback only (`IPAddressAllow=localhost`), with no URL logging; refusals are
+    logged with the eppn and the reason. It doesn't re-verify the token's signature (it comes
+    from oauth2-proxy's encrypted session on loopback) or its `exp` (CILogon ID tokens last
+    minutes; the session's length is oauth2-proxy's).
+  - **Why not njs:** nginx's JavaScript module could decode the token in nginx, but on Ubuntu
+    24.04 it is in universe (no guaranteed security updates) and would sit inside the
+    internet-facing nginx. A separate loopback service is easier to audit and to sandbox.
+  - **nginx:** `/oauth2/` goes to oauth2-proxy; `/oauth2/auth` is 404 from outside (only
+    review-authz asks it); everything else runs `auth_request` to review-authz. Not signed in:
+    pages redirect to the sign-in and API calls get 401 (the page reloads). Forged
+    `X-Review-User` or `X-Auth-Request-*` headers from a browser are never read: nginx takes
+    the name only from review-authz's response. Neither the `Authorization` header nor the
+    session cookie reaches a container.
   - **Usernames:** reviewer names are their CCDB usernames, so no mapping table is needed.
     **Confirmed 2026-11-18** at https://cilogon.org/testidp/: the Alliance IdP releases
     `ePPN = <ccdb-username>@alliancecan.ca`, plus name, email and affiliation
     (`member@alliancecan.ca`). It is R&S and SIRTFI, and its assurance is `IAP/low`.
-  - **Egress:** the review VM's security group gains `cilogon.org` (443 to 75.2.49.220 and
-    99.83.186.75, AWS Global Accelerator) for the token and key endpoints. Containers still have
-    no network.
-  - **Needs:** a DNS name and a publicly trusted certificate for the review VM (the callback
-    must be HTTPS).
-  - **MFA is required (decision 2026-11-18).** The sign-in asks for it with
-    `acr_values=https://refeds.org/profile/mfa`, and the server refuses any ID token whose
-    `acr` claim isn't that value. With oauth2-proxy: `--oidc-groups-claim=acr` plus
-    `--allowed-group=https://refeds.org/profile/mfa`. **Confirmed 2026-11-18:** the Alliance
-    login through CILogon asks for Duo and asserts `AuthnContextClassRef =
-    https://refeds.org/profile/mfa`. **[VERIFY]** when the client is registered that CILogon
-    passes it on as the OIDC `acr` claim, and that a sign-in without it is refused.
-- **Certificate:** `configure` makes a self-signed certificate if none exists. Replace
-  `/etc/brine-review/web/tls.crt` and `tls.key` with a real one (same paths).
+  - **Egress:** the review VM's security group allows 443 to `sso_cidrs` (cilogon.org,
+    75.2.49.220 and 99.83.186.75, AWS Global Accelerator static addresses) for the token and
+    key endpoints. Containers still have no network, and the reviewers group is still dropped
+    by nftables.
+  - **CILogon's test instance (2026-11-20).** The pilot client
+    (`cilogon:oa4mp,2012:/client_id/6a13…`) is registered on **test.cilogon.org**, so the VM
+    runs with `SSO_ISSUER=https://test.cilogon.org` and egress to its own Global Accelerator
+    addresses, 3.33.212.95 and 15.197.204.227 (`SSO_CIDRS` in review.env and `sso_cidrs` in
+    terraform.tfvars, which must match). Production cilogon.org is blocked meanwhile. The
+    Alliance IdP is in test's IdP list, so the IdP and MFA settings stay the same. Moving to
+    production means a new client, removing those three settings, `review apply`, then
+    `review deploy` and `review sso-secret`. CILogon client IDs contain a comma
+    (`oa4mp,2012`); configure accepts it, and the Lima mock uses an ID of the same shape.
+  - **Refusal pages (2026-11-21).** A signed-in account that is refused (not active, no MFA,
+    another IdP) gets a 403 page saying it is not an active reviewer; the reason is in
+    `journalctl -u review-authz`. When oauth2-proxy is down (for example, no client secret
+    yet) or review-authz errors, the page says sign-in is unavailable (503). Both still
+    refuse; the app's own `/api/` calls get only the status code.
+  - **MFA is required (decision 2026-11-18).** **Confirmed 2026-11-18:** the Alliance login
+    through CILogon asks for Duo and asserts `AuthnContextClassRef =
+    https://refeds.org/profile/mfa`. **[VERIFY]** once the client is registered that CILogon
+    passes it on as the OIDC `acr` claim (otherwise every sign-in is refused: it fails closed)
+    and that the `idp` claim is the entityID above (test 66).
+  - **Tested** on the local VM against `local/mock-oidc.py`, a mock provider that signs in
+    whoever the test names (`local/sso on`): the wrong IdP, no or password-only `acr`, a
+    non-Alliance eppn, capitals, a non-reviewer, a pending reviewer, and deactivation
+    mid-session are all refused (tests 51, 62-65, 67).
+  - **Needs:** a DNS name (`SSO_HOST`) and a publicly trusted certificate for it, installed
+    with `review web-cert <fullchain.pem> <key.pem>`.
+- **Certificate:** `configure` makes a self-signed certificate if none exists.
+  `review web-cert` replaces it after checking the key matches, the certificate covers
+  `SSO_HOST` and has at least 7 days left (the old one is restored if nginx rejects the new one).
+- **Certificate push (2026-11-20).** SHARCNET's Ansible host keeps the certificate current,
+  without root or a shell on the VM. Set `CERT_PUSH_KEY` (one public key), `CERT_PUSH_CIDRS`
+  (the pusher's addresses; the same in `cert_push_cidrs` in terraform.tfvars) and `SSO_HOST`,
+  then `review apply` and `review deploy`. That creates a `certpush` account that can do one
+  thing: run `install-web-cert`, which reads a tar of `tls.crt` and `tls.key` on stdin.
+  - sshd forces the command for `certpush` (`ForceCommand`, no TTY, no forwarding of any
+    kind, public key only). Its key sits in a root-owned file with `from=` and `restrict`.
+  - sudo allows `install-web-cert` with no arguments and nothing else. `certpush` isn't a
+    reviewer, has no password and owns no files.
+  - Port 22 opens to `CERT_PUSH_CIDRS` only, and pam_access admits `certpush` from there
+    alone (once `--admin-access` is on).
+  - The installer treats the push as untrusted: 1 MiB cap, plain files only (no links), the
+    key must match, the certificate must cover `SSO_HOST` for 7 more days, and nginx must
+    accept it, or the old pair stays. It logs who installed what.
+  - The Ansible side is one task: `tar -c tls.crt tls.key | ssh certpush@SSO_HOST`. Ansible's
+    usual modules can't run here (no shell, no sftp), on purpose.
+  - Test 68 checks all of it; with `CERT_PUSH_TEST_KEY` (the local VM) it also pushes a wrong
+    certificate and a right one.
+  - Leave `CERT_PUSH_KEY` empty and `review deploy` removes the account, key file and rule.
 
 ### 8.2 Who owns the home folder
 
@@ -750,6 +848,24 @@ Set `WEB_PASSWORDS_FILE` to a file of `<user> <password>` lines for the test rev
 | 60 | Response headers; `review-web.access.log`; `/var/lib/nginx` | `default-src 'none'` CSP and HSTS; no URLs or file names in the log; no temp files |
 | 61 | Over the web, ask pi to run `cat /etc/passwd` with a shell and to give a link | It completes with only file tools; no shell tool, no passwd contents; read the answer: no link |
 
+### 11.11 SSO sign-in (WEB_AUTH=sso)
+
+Against real CILogon only 62, 63 and 66 can run: the web tests above need to sign in as test
+reviewers, which only the mock provider can do. So on a real VM, run the whole suite in basic
+mode first, then remove the test reviewers and the passwords file, set `WEB_AUTH=sso`,
+`review deploy`, `review sso-secret`, and run 62, 63, 66 and 67. On
+the local VM, `local/sso on` runs everything in SSO mode against the mock.
+
+| # | Test | Expected |
+|---|---|---|
+| 62 | `/oauth2/start` | Redirects to `SSO_ISSUER/authorize` with `acr_values` = MFA, `idphint` = the Alliance IdP, PKCE S256, a nonce, `redirect_uri=https://SSO_HOST/oauth2/callback`, scope with `org.cilogon.userinfo` |
+| 63 | `/oauth2/auth` from outside; forged `X-Review-User`/`X-Auth-Request-Email` headers and cookie; listeners; `nginx -T`; secret file modes; `request_logging` | 404; 401; oauth2-proxy and review-authz on 127.0.0.1 only; no `auth_basic`; secrets `root:oauth2-proxy 640`; logging off; no `htpasswd` files |
+| 64 | Mock sign-ins: active reviewer with MFA; no `acr`; password-only `acr`; another IdP asserting an Alliance eppn; no `idp`; another domain; a non-reviewer; capitals | 200, then 403 for every other case; review-authz logs the other-IdP refusal itself |
+| 65 | Sign in as testa2, mark testa2 pending and sync, reuse the session; then reactivate | The session is refused at once (401/403); signing in works again within seconds |
+| 66 | Real CILogon (MANUAL) | An active test reviewer gets in with Alliance login and Duo; a non-reviewer gets Forbidden; logs show the refusal, no URLs; a trusted certificate |
+| 67 | Session cookie flags; oauth2-proxy and review-authz logs | `__Host-review_sso`, Secure, HttpOnly, SameSite=Lax; no URLs or file names |
+| 68 | `certpush` (when `CERT_PUSH_KEY` is set): `sshd -T` for it and for another user; `sudo -l -U certpush`; its key file; with `CERT_PUSH_TEST_KEY`: a command line, a remote forward, a certificate for another host, then a valid one | `ForceCommand` install-web-cert, no TTY or forwarding, publickey only, nothing forced on other users; sudo: that command with no arguments only; root-owned key with `from=` and `restrict`; the command reaches only the installer, forwarding fails, the wrong host is refused, the valid one is served |
+
 Then remove the remaining test reviewers with `--purge-data`, revoke their keys, and delete the
 canary files.
 
@@ -799,8 +915,9 @@ canary files.
   snapshot the VM, attach a security group or open the console, so project membership is part
   of the trust boundary. Application credentials get an expiry date.
 - **Access:**
-  - Reviewers use the web page only (a password now, CILogon with MFA later). Sign-in stays
-    off until activation. Reviewers have no SSH access.
+  - Reviewers use the web page only, signing in with CILogon and MFA. The VM keeps no web
+    passwords in that mode (basic mode is for acceptance testing before CILogon, with test
+    accounts only). Sign-in stays off until activation. Reviewers have no SSH access.
   - Admin logins are allowed only from allowlisted addresses (pam_access).
   - fail2ban watches sshd.
 - **Offboarding during the review** (conflict of interest, withdrawal or a lost key): for one
@@ -814,7 +931,8 @@ canary files.
      the VM (`dd if=/dev/zero of=/dev/vdb bs=4M oflag=direct status=progress`), then delete
      it. That is best effort. With an encrypted volume type instead, confirm its key is gone
      from Barbican; that is what destroys the data.
-  4. Delete the VM if it's no longer needed.
+  4. Delete the VM if it's no longer needed. To release its address too, remove `prevent_destroy`
+     from the floating IP in `terraform/main.tf`, and have the DNS record deleted.
 
   Record the date each step was done.
 - **Patching:**
@@ -837,7 +955,6 @@ canary files.
 
 ```
 Sign in:      https://<review host>/  with your Alliance (CCDB) account and its MFA
-              (until single sign-on is live: the username and password we sent you)
 Left:         the applications assigned to you
 Middle:       the original PDF, or its extracted text
 Right:        the assistant, and your notes for that application

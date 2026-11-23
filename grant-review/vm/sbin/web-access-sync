@@ -1,0 +1,9 @@
+#!/bin/bash
+# web-access-sync
+#
+# Rewrites the web sign-in's active list from the reviewers who aren't pending, and reloads
+# nginx. activate-reviewer and remove-reviewer do this themselves; configure runs it too.
+source /usr/local/lib/brine-review/common.sh
+[[ $# -eq 0 ]] || die "usage: web-access-sync"
+write_web_access
+log "web access: $(wc -l < "$WEB_DIR/active") active reviewer(s)"

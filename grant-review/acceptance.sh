@@ -9,6 +9,10 @@
 # Before the first run:
 #   - testa, testb and testa2 added, sample.pdf and sample.txt loaded for each, and activated
 #   - WEB_PASSWORDS_FILE in review.env: "<user> <password>" lines for them (web tests 57-61)
+#   - WEB_AUTH=sso: tests 62-67 check the CILogon sign-in. The web tests (51, 57-61, 64, 65, 67)
+#     sign in through a mock provider (MOCK_OIDC, local/sso on); against real CILogon they
+#     SKIP, so run the whole suite in basic mode first; then remove the test reviewers and the
+#     passwords file (no passwords stay with a CILogon site), switch to sso and run 62-67.
 #   - review.env filled in and the host key pinned (review pin-hostkey)
 #   - optional: PENDING_USER=<name> of a test reviewer that is added but NOT activated (test 51)
 #
@@ -38,6 +42,8 @@ source "$envf"
 logdir=${TEST_LOGS_DIR:-$here/test-logs}
 LOCAL_TEST=${LOCAL_TEST:-0}
 : "${VM_ADMIN:=ubuntu}" "${BRINE_URL:=https://brine.sharcnet.ca}" "${PENDING_USER:=}"
+: "${WEB_AUTH:=basic}" "${SSO_ISSUER:=https://cilogon.org}" "${SSO_DOMAIN:=alliancecan.ca}" "${MOCK_OIDC:=}"
+: "${SSO_IDP:=https://idp.alliancecan.ca/idp/shibboleth}" "${SSO_MFA:=https://refeds.org/profile/mfa}"
 brine_host=${BRINE_URL#https://}; brine_host=${brine_host%%/*}
 model=${MODELS%% *}
 [[ -n $model ]] || die "MODELS is empty in review.env"
@@ -47,6 +53,7 @@ kh=${REVIEW_SSH_DIR:-$here/.ssh}/known_hosts
 [[ -s $kh ]] || die "host key not pinned: review pin-hostkey"
 
 tmp=$(mktemp -d)
+mac_tar=""; [[ $(uname) == Darwin ]] && mac_tar="--no-xattrs --no-mac-metadata"
 mkdir -p "$logdir"
 log=$logdir/acceptance-$(date +%Y%m%d-%H%M%S).log
 exec > >(tee -a "$log") 2>&1
@@ -154,8 +161,8 @@ t3() { local o; o=$(vm_root 'ls -d /usr/local/sbin/enter-review /etc/sudoers.d/r
 t4() { not_local || return 3; local g o bad
   g=$(terraform -chdir="$here/terraform" output -raw review_group_id)
   o=$(openstack security group rule list "$g" --ingress -f value -c "IP Range" -c "Port Range"); echo "$o"
-  bad=$(awk '$2=="22:22"{print $1}' <<<"$o" | while read -r c; do [[ " $ADMIN_CIDRS " == *" $c "* ]] || echo "$c"; done)
-  [[ -z $bad ]]; check $? "port 22 open only to ADMIN_CIDRS${bad:+ (also: $bad)}"; }
+  bad=$(awk '$2=="22:22"{print $1}' <<<"$o" | while read -r c; do [[ " $ADMIN_CIDRS ${CERT_PUSH_CIDRS:-} ${ROOT_SSH_CIDRS:-} " == *" $c "* ]] || echo "$c"; done)
+  [[ -z $bad ]]; check $? "port 22 open only to ADMIN_CIDRS, CERT_PUSH_CIDRS and ROOT_SSH_CIDRS${bad:+ (also: $bad)}"; }
 
 t5() { local o l; o=$(vm_root 'sshd -T -C user=testa,host=x,addr=203.0.113.1')
   for l in "denygroups reviewers" "permitrootlogin no" "permituserenvironment no" "maxauthtries 3"; do
@@ -358,7 +365,10 @@ t51() { local u o
     o=$(in_ctr "$u" 'cat ~/.acceptance-whoami; ls ~/originals'); echo "$u: $o"
     [[ $(head -1 <<<"$o") == "$u" ]]; check $? "$u's container holds its own home"
   done
-  if [[ -n $PENDING_USER ]] && web_ready && grep -q "^$PENDING_USER " "$WEB_PASSWORDS_FILE"; then
+  if [[ -n $PENDING_USER && $WEB_AUTH == sso ]] && web_ready; then
+    o=$(sso_login "$tmp/jar-pending" "$(claims "$PENDING_USER@$SSO_DOMAIN")"); echo "$PENDING_USER sso: $o"
+    [[ $o == 403 ]]; check $? "not-yet-activated $PENDING_USER refused on the web"
+  elif [[ -n $PENDING_USER ]] && web_ready && grep -q "^$PENDING_USER " "$WEB_PASSWORDS_FILE"; then
     o=$(wcurl "$PENDING_USER" -o /dev/null -w '%{http_code}' "$web/api/apps"); echo "$PENDING_USER web: $o"
     [[ $o == 401 ]]; check $? "not-yet-activated $PENDING_USER refused on the web"
   else NOTE="set PENDING_USER (added, not activated, with a line in WEB_PASSWORDS_FILE) to test refusal before activation"; fi; }
@@ -407,14 +417,57 @@ wcfg() {  # curl config with that reviewer's web password, so it never appears i
   fi
   echo "$f"
 }
-wcurl() { local u=$1; shift; curl -sk -K "$(wcfg "$u")" "$@"; }
-web_ready() { [[ -n ${WEB_PASSWORDS_FILE:-} && -r $WEB_PASSWORDS_FILE ]] || { NOTE="set WEB_PASSWORDS_FILE"; return 1; }; }
+# SSO sign-in through the mock provider: queue the claims, then follow the whole redirect
+# chain with a cookie jar. Prints the final HTTP status (200 = signed in and allowed).
+claims() {  # claims <eppn> [idp] [acr]   ("null" leaves a claim out)
+  local q='"'
+  printf '{"eppn":%s,"idp":%s,"acr":%s}' "$q$1$q" \
+    "$( [[ ${2:-$SSO_IDP} == null ]] && echo null || echo "$q${2:-$SSO_IDP}$q")" \
+    "$( [[ ${3:-$SSO_MFA} == null ]] && echo null || echo "$q${3:-$SSO_MFA}$q")"
+}
+sso_login() {  # sso_login <jar> <claims-json>
+  curl -s -o /dev/null -X POST -H 'Content-Type: application/json' -d "$2" "$MOCK_OIDC/test/next" || return 1
+  rm -f "$1"
+  curl -sk -c "$1" -b "$1" -o /dev/null -w '%{http_code}' -L --max-redirs 8 "$web/oauth2/start?rd=/api/apps"
+}
+sso_jar() {  # a signed-in jar for an active test reviewer
+  local j=$tmp/jar-$1
+  [[ -s $j ]] || [[ $(sso_login "$j" "$(claims "$1@$SSO_DOMAIN")") == 200 ]] || return 1
+  echo "$j"
+}
+wcurl() {
+  local u=$1; shift
+  if [[ $WEB_AUTH == sso ]]; then curl -sk -b "$(sso_jar "$u")" "$@"
+  else curl -sk -K "$(wcfg "$u")" "$@"; fi
+}
+web_ready() {
+  if [[ $WEB_AUTH == sso ]]; then
+    [[ -n $MOCK_OIDC ]] || { NOTE="WEB_AUTH=sso without a mock provider: run the web tests in basic mode"; return 1; }
+    return 0
+  fi
+  [[ -n ${WEB_PASSWORDS_FILE:-} && -r $WEB_PASSWORDS_FILE ]] || { NOTE="set WEB_PASSWORDS_FILE"; return 1; }; }
+sso_only() { [[ $WEB_AUTH == sso ]] || { NOTE="WEB_AUTH=basic"; return 1; }; }
+mock_only() { sso_only && [[ -n $MOCK_OIDC ]] || { NOTE="${NOTE:-needs the mock provider (local/sso on)}"; return 1; }; }
 
-t57() { web_ready || return 3; local o
+t57() { [[ $WEB_AUTH == sso ]] && { t57_sso; return; }
+  web_ready || return 3; local o
   o=$(curl -sk -o /dev/null -w '%{http_code}' -D "$tmp/h" "$web/"); echo "no auth: $o"
   [[ $o == 401 ]] && grep -qi '^www-authenticate: basic' "$tmp/h"; check $? "no password: 401 with a sign-in prompt"
   o=$(curl -sk -u 'testa:not-the-password' -o /dev/null -w '%{http_code}' "$web/api/apps"); echo "wrong password: $o"
   [[ $o == 401 ]]; check $? "wrong password refused"
+  o=$(curl -sk -o /dev/null -w '%{http_code}' "http://$ip/" 2>/dev/null); echo "plain http: $o"
+  [[ $o == 000 ]]; check $? "no plain-HTTP listener"; }
+
+t57_sso() { local o loc pw
+  o=$(curl -sk -o /dev/null -w '%{http_code} %{redirect_url}' "$web/"); echo "no session, page: $o"
+  [[ $o == "302 $web/oauth2/start?rd=/" ]]; check $? "page without a session goes to the sign-in"
+  o=$(curl -sk -o /dev/null -w '%{http_code}' "$web/api/apps"); echo "no session, API: $o"
+  [[ $o == 401 ]]; check $? "API without a session: 401"
+  pw=$(awk '$1 == "testa" { print $2 }' "${WEB_PASSWORDS_FILE:-/dev/null}")
+  if [[ -n $pw ]]; then
+    o=$(curl -sk -K <(printf 'user = "testa:%s"\n' "$pw") -o /dev/null -w '%{http_code}' "$web/api/apps"); echo "basic auth, right password: $o"
+    [[ $o == 401 ]]; check $? "a web password no longer signs in"
+  fi
   o=$(curl -sk -o /dev/null -w '%{http_code}' "http://$ip/" 2>/dev/null); echo "plain http: $o"
   [[ $o == 000 ]]; check $? "no plain-HTTP listener"; }
 
@@ -437,7 +490,8 @@ t59() { web_ready || return 3; local c
   [[ $(c "$web/api/apps/..%2F..%2Fetc%2Fpasswd/original") == 400 ]]; check $? "encoded traversal refused"
   [[ $(c --path-as-is "$web/api/apps/../../../etc/passwd") =~ ^40[04]$ ]]; check $? "raw traversal refused"
   [[ $(c "$web/server.js") == 404 && $(c "$web/system-prompt.md") == 404 ]]; check $? "server files not served"
-  in_ctr testa 'ln -sfn /etc/passwd ~/work/sample.pdf/notes.md 2>/dev/null; true' >/dev/null
+  # mkdir first: on a new VM the folder appears only with the first notes write.
+  in_ctr testa 'mkdir -p ~/work/sample.pdf && ln -sfn /etc/passwd ~/work/sample.pdf/notes.md' >/dev/null
   [[ $(c -X PUT -H 'X-Review: 1' -H 'Content-Type: application/json' -d '{"text":"x"}' "$web/api/apps/sample.pdf/notes") == 400 ]]; check $? "won't write notes through a link"
   in_ctr testa 'rm -f ~/work/sample.pdf/notes.md' >/dev/null; }
 
@@ -463,6 +517,137 @@ t61() { web_ready || return 3; local o i
   ! grep -q 'root:x:0:0' "$tmp/ev"; check $? "no host or container passwd contents"
   NOTE="read the answer in the log: it should refuse the shell and give no link"
   grep -o '"t":"delta","text":"[^"]*"' "$tmp/ev" | sed 's/.*"text":"//; s/"$//' | tr -d '\n' | head -c 800; echo; }
+
+# ---------- 11.11 SSO sign-in (WEB_AUTH=sso) ----------
+
+t62() { sso_only || return 3; local loc
+  loc=$(curl -sk -o /dev/null -w '%{redirect_url}' "$web/oauth2/start?rd=/"); echo "start -> ${loc%%\?*}"
+  tr '&?' '\n\n' <<<"$loc" | grep -E '^(acr_values|idphint|code_challenge_method|redirect_uri|scope|response_type)=' | sed 's/^/    /'
+  enc() { jq -rn --arg v "$1" '$v|@uri'; }
+  [[ $loc == "$SSO_ISSUER/authorize?"* ]]; check $? "sends the browser to the identity provider ($SSO_ISSUER)"
+  has "$loc" "acr_values=$(enc "$SSO_MFA")"; check $? "asks for MFA (acr_values)"
+  has "$loc" "idphint=$(enc "$SSO_IDP")"; check $? "names the Alliance IdP (idphint)"
+  has "$loc" "code_challenge_method=S256" && has "$loc" "nonce="; check $? "PKCE S256 and a nonce"
+  has "$loc" "redirect_uri=$(enc "https://$(vm_root '. /etc/brine-review/review.conf; echo $SSO_HOST')/oauth2/callback")"; check $? "callback is https://SSO_HOST/oauth2/callback"
+  has "$loc" "org.cilogon.userinfo"; check $? "asks for eppn and idp (org.cilogon.userinfo)"; }
+
+t63() { sso_only || return 3; local o
+  o=$(curl -sk -o /dev/null -w '%{http_code}' "$web/oauth2/auth"); echo "/oauth2/auth from outside: $o"
+  [[ $o == 404 ]]; check $? "oauth2-proxy's auth endpoint not reachable from outside"
+  o=$(curl -sk -o /dev/null -w '%{http_code}' -H 'X-Review-User: testa' -H 'X-Auth-Request-Email: testa@alliancecan.ca' \
+      -H 'X-Forwarded-User: testa' -H 'Cookie: __Host-review_sso=forged' "$web/api/apps"); echo "forged headers and cookie: $o"
+  [[ $o == 401 ]]; check $? "forged identity headers and cookie refused"
+  o=$(vm_root 'ss -ltnpH | grep -E "oauth2-proxy|python3" | awk "{print \$4}"; nginx -T 2>/dev/null | grep -c "auth_basic " ;
+    stat -c "%U:%G %a %n" /etc/brine-review/sso/client-secret /etc/brine-review/sso/cookie-secret /etc/brine-review/web/active-emails;
+    systemctl show -p IPAddressAllow --value oauth2-proxy; systemctl show -p IPAddressAllow --value review-authz;
+    grep -E "^request_logging" /etc/brine-review/sso/oauth2-proxy.cfg;
+    ls /etc/brine-review/web/htpasswd* 2>/dev/null | sed "s/^/password file: /"'); echo "$o"
+  ! grep -q '^password file: ' <<<"$o"; check $? "no web password files on the VM"
+  ! grep -E '^[0-9.:\[\]*]+:[0-9]+$' <<<"$o" | grep -vqE '^127\.0\.0\.1:418[01]$'; check $? "oauth2-proxy and review-authz listen on loopback only"
+  hasE "$o" '^0$'; check $? "no basic auth left in nginx"
+  [[ $(grep -cE '^root:oauth2-proxy 640 ' <<<"$o") -eq 3 ]]; check $? "secrets and the active list readable by oauth2-proxy only"
+  has "$o" "request_logging     = false"; check $? "oauth2-proxy request logging (URLs) off"; }
+
+t64() { mock_only || return 3; local o who
+  try() { o=$(sso_login "$tmp/jar-x" "$1"); echo "  $2: $o"; [[ $o == "$3" ]]; check $? "$2"; }
+  try "$(claims "testa@$SSO_DOMAIN")"                               "active reviewer, Alliance IdP, MFA: allowed" 200
+  try "$(claims "testa@$SSO_DOMAIN" "" null)"                       "no acr claim: refused" 403
+  try "$(claims "testa@$SSO_DOMAIN" "" urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport)" "password-only acr: refused" 403
+  try "$(claims "testa@$SSO_DOMAIN" https://idp.example.org/idp/shibboleth)" "another IdP asserting an Alliance eppn: refused" 403
+  try "$(claims "testa@$SSO_DOMAIN" null)"                          "no idp claim: refused" 403
+  try "$(claims "testa@example.ca")"                                "eppn in another domain: refused" 403
+  try "$(claims "nobody@$SSO_DOMAIN")"                              "Alliance account that isn't a reviewer: refused" 403
+  try "$(claims "TestA@$SSO_DOMAIN")"                               "eppn with capitals: refused" 403
+  o=$(wcurl testb "$web/api/apps"); has "$o" '"sample.pdf"'; check $? "testb signs in and sees its own applications"
+  o=$(vm_root 'journalctl -u review-authz --since -10min --no-pager -o cat | tail -5'); echo "$o" | sed 's/^/    authz: /'
+  has "$o" "idp is not the Alliance IdP"; check $? "review-authz refused the other IdP itself"; }
+
+t65() { mock_only || return 3; local j o
+  j=$(sso_jar testa2) || { check 1 "testa2 signs in"; return; }
+  [[ $(curl -sk -b "$j" -o /dev/null -w '%{http_code}' "$web/api/apps") == 200 ]]; check $? "testa2 signed in"
+  vm_root ': > /etc/brine-review/pending/testa2; /usr/local/sbin/web-access-sync >/dev/null'
+  o=$(curl -sk -b "$j" -o /dev/null -w '%{http_code}' "$web/api/apps"); echo "same session after deactivation: $o"
+  [[ $o == 401 || $o == 403 ]]; check $? "taking a reviewer off the active list ends their session at once"
+  vm_root 'rm -f /etc/brine-review/pending/testa2; /usr/local/sbin/web-access-sync >/dev/null'
+  local i ok=1   # oauth2-proxy re-reads the list a moment after it changes
+  for i in 1 2 3 4 5 6; do rm -f "$tmp/jar-testa2"; sso_jar testa2 >/dev/null && { ok=0; break; }; sleep 1; done
+  echo "signed in again after ${i}s"; check $ok "testa2 can sign in again once reactivated"; }
+
+t66() { sso_only || return 3
+  manual "with real CILogon at https://SSO_HOST/: (a) an activated reviewer (you) signs in with their Alliance account and Duo and sees only their applications; (b) an Alliance account that isn't on the list gets 'Forbidden'; (c) journalctl -u review-authz and -u oauth2-proxy show the refusal, with no URLs; (d) the browser shows a trusted certificate for SSO_HOST"; }
+
+t67() { mock_only || return 3; local h o
+  rm -f "$tmp/jar-c"; curl -s -o /dev/null -X POST -H 'Content-Type: application/json' -d "$(claims "testa@$SSO_DOMAIN")" "$MOCK_OIDC/test/next"
+  h=$(curl -sk -c "$tmp/jar-c" -b "$tmp/jar-c" -D - -o /dev/null -L --max-redirs 8 "$web/oauth2/start?rd=/" | grep -i '^set-cookie: __Host-review_sso')
+  echo "$h" | sed -E 's/=[^;]{12}[^;]*/=…/' | head -2
+  grep -qi 'secure' <<<"$h" && grep -qi 'httponly' <<<"$h" && grep -qi 'samesite=lax' <<<"$h"; check $? "session cookie is __Host-, Secure, HttpOnly, SameSite=Lax"
+  o=$(vm_root 'journalctl -u oauth2-proxy -u review-authz --since -30min --no-pager -o cat'); echo "$o" | tail -3 | sed 's/^/    /'
+  ! grep -qE 'sample\.|/api/|rd=' <<<"$o"; check $? "sign-in logs hold no URLs or file names"; }
+
+# Root by SSH key (ROOT_SSH_KEYS): keys only, from ROOT_SSH_CIDRS only, every key carrying from=.
+t69() { local o a n c
+  if [[ -z ${ROOT_SSH_KEYS:-} ]]; then
+    o=$(vm_root 'grep -c . /root/.ssh/authorized_keys; ls /etc/ssh/sshd_config.d/55-root.conf 2>&1')
+    hasE "$o" '^0$' && has "$o" 'No such file'; check $? "no root keys, no root Match block"; return 0
+  fi
+  a=${ROOT_SSH_CIDRS%%[/ ]*}; n=$(grep -c . <<<"$ROOT_SSH_KEYS")
+  o=$(vm_root "sshd -T -C user=root,host=x,addr=$a | grep -Ei '^(permitrootlogin|authenticationmethods|allowagentforwarding|x11forwarding) '; echo ---;
+    sshd -T -C user=root,host=x,addr=203.0.113.1 | grep -i '^permitrootlogin'; echo ---;
+    stat -c '%U:%G %a' /root/.ssh/authorized_keys; sed -E 's/ (ssh-|ecdsa-).*//' /root/.ssh/authorized_keys | sort | uniq -c; grep -c . /root/.ssh/authorized_keys")
+  echo "$o" | sed 's/^/  /'
+  hasE "$o" '^permitrootlogin without-password$'; check $? "root by key from $a"
+  hasE "$o" '^authenticationmethods publickey$'; check $? "root: publickey only"
+  [[ $(awk '/^---$/{n++; next} n==1' <<<"$o") == "permitrootlogin no" ]]; check $? "no root login from other addresses"
+  c=$(awk '/^---$/{n++; next} n==2' <<<"$o")
+  hasE "$c" '^root:root 600$'; check $? "root's authorized_keys is root-only"
+  hasE "$c" "^ *$n from=\"${ROOT_SSH_CIDRS// /,}\",no-agent-forwarding,no-X11-forwarding\$" && hasE "$c" "^$n\$"
+  check $? "exactly the $n ROOT_SSH_KEYS, each limited to ROOT_SSH_CIDRS"; }
+
+# The certificate pusher (CERT_PUSH_KEY): one key that can run install-web-cert and nothing
+# else. With CERT_PUSH_TEST_KEY (its private key; the local VM) it also pushes for real.
+t68() { [[ -n ${CERT_PUSH_KEY:-} ]] || { echo "CERT_PUSH_KEY not set"; return 3; }; local o a k c
+  a=${CERT_PUSH_CIDRS%%[/ ]*}
+  o=$(vm_root "sshd -T -C user=certpush,host=x,addr=$a; echo ---; sshd -T -C user=someone,host=x,addr=$a | grep -i '^forcecommand' | grep -v ' none\$'; echo ---;
+    sudo -l -U certpush | sed -n '/may run/,\$p'; echo ---; stat -c '%U:%G %a' /etc/ssh/certpush_authorized_keys;
+    sed -E 's/ (ssh-|ecdsa-).*//' /etc/ssh/certpush_authorized_keys; id -nG certpush; passwd -S certpush | cut -d' ' -f2;
+    grep -c . /etc/ssh/certpush_authorized_keys")
+  echo "$o" | sed -n '/^---$/,$p' | sed 's/^/  /'
+  hasE "$o" '^forcecommand sudo -n /usr/local/sbin/install-web-cert$'; check $? "sshd forces install-web-cert for certpush"
+  for k in "permittty no" "allowtcpforwarding no" "allowagentforwarding no" "x11forwarding no" "permittunnel no" "authenticationmethods publickey"; do
+    hasE "$o" "^$k\$"; check $? "certpush: $k"
+  done
+  [[ $(awk '/^---$/{n++; next} n==1' <<<"$o") == "" ]]; check $? "the forced command reaches no other user"
+  [[ $(awk '/^---$/{n++; next} n==2 && /^ +\(/' <<<"$o" | sed 's/^ *//') == '(root) NOPASSWD: /usr/local/sbin/install-web-cert ""' ]]
+  check $? "sudo: install-web-cert with no arguments, and nothing else"
+  c=$(awk '/^---$/{n++; next} n==3' <<<"$o")
+  hasE "$c" '^root:root 644$'; check $? "key file root-owned, read-only to certpush"
+  hasE "$c" "^from=\"${CERT_PUSH_CIDRS// /,}\",restrict,command=\"sudo -n /usr/local/sbin/install-web-cert\"\$"; check $? "key limited to CERT_PUSH_CIDRS, restricted, forced command"
+  hasE "$c" '^1$'; check $? "exactly one key"
+  ! hasE "$c" '(^| )reviewers( |$)'; check $? "certpush is not a reviewer"
+  [[ -n ${CERT_PUSH_TEST_KEY:-} ]] || { echo "  (no CERT_PUSH_TEST_KEY: live push not tried)"; return 0; }
+  local ssh_cp=(ssh -i "$CERT_PUSH_TEST_KEY" "${ssh_common[@]}" -o BatchMode=yes "certpush@$ip")
+  o=$("${ssh_cp[@]}" 'id; cat /etc/shadow' 2>&1 </dev/null); echo "  any command: $o"
+  ! has "$o" 'uid=' && has "$o" 'expected a tar'; check $? "a command line only reaches the installer"
+  o=$("${ssh_cp[@]}" -o ExitOnForwardFailure=yes -R 54180:127.0.0.1:22 true 2>&1 </dev/null); echo "  forwarding: $o"
+  hasE "$o" 'forwarding failed'; check $? "port forwarding refused"
+  mkdir -p "$tmp/cp"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj "/CN=wrong.example" \
+    -addext "subjectAltName=DNS:wrong.example" -keyout "$tmp/cp/tls.key" -out "$tmp/cp/tls.crt" 2>/dev/null
+  o=$(COPYFILE_DISABLE=1 tar $mac_tar -C "$tmp/cp" -cf - tls.crt tls.key | "${ssh_cp[@]}" 2>&1); echo "  wrong host: $o"
+  has "$o" "doesn't cover"; check $? "a certificate for another host is refused"
+  local san="DNS:$SSO_HOST"; [[ $SSO_HOST =~ ^[0-9.]+$ ]] && san="IP:$SSO_HOST"
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 -subj "/CN=$SSO_HOST" \
+    -addext "subjectAltName=$san" -keyout "$tmp/cp/tls.key" -out "$tmp/cp/tls.crt" 2>/dev/null
+  o=$(COPYFILE_DISABLE=1 tar $mac_tar -C "$tmp/cp" -cf - tls.crt tls.key | "${ssh_cp[@]}" 2>&1); echo "  push: $o"
+  has "$o" "installed by certpush"; check $? "a valid certificate is installed and nginx reloaded"
+  local sni=(-servername "$SSO_HOST"); [[ $SSO_HOST =~ ^[0-9.]+$ ]] && sni=()   # SNI can't carry an address
+  local got want; want=$(openssl x509 -in "$tmp/cp/tls.crt" -noout -fingerprint -sha256)
+  local i; for i in 1 2 3 4 5 6; do   # a reload returns before the new workers take over
+    got=$(openssl s_client -connect "$ip:443" ${sni[@]+"${sni[@]}"} </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256)
+    [[ $got == "$want" ]] && break; sleep 1
+  done
+  echo "  served: $got"; [[ -n $got && $got == "$want" ]]; check $? "nginx now serves the pushed certificate"
+  rm -rf "$tmp/cp"; }
 
 # ---------- run ----------
 
@@ -518,6 +703,14 @@ run 58 "web: each reviewer reaches only their own"  t58
 run 59 "web: cross-site, traversal and link tricks" t59
 run 60 "web: headers and metadata-only logs"        t60
 run 61 "web: chat works without a shell or links"   t61
+run 62 "SSO: CILogon, MFA, Alliance IdP, PKCE"      t62
+run 63 "SSO: no way around the sign-in"             t63
+run 64 "SSO: IdP, MFA, eppn and active list checked" t64
+run 65 "SSO: deactivation ends a session at once"   t65
+run 66 "SSO: real CILogon sign-in"                  t66
+run 67 "SSO: cookie flags; no URLs in sign-in logs" t67
+run 68 "certificate push: install-web-cert only"     t68
+run 69 "root: SSH key only, admin addresses only"   t69
 run 52 "key revocation"                             t52
 run 54 "remove-reviewer"                            t54
 

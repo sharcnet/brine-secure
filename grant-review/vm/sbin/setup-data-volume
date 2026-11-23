@@ -23,6 +23,12 @@ findmnt -rno SOURCE | grep -qx "$dev" && die "$dev is mounted"
 if ! modprobe -q quota_v2; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -q
+  # An image older than the archive runs a kernel whose extras are gone from the mirror. Then
+  # only the current kernel (with its extras, via linux-generic) can work: install it, reboot.
+  if ! apt-cache policy "linux-modules-extra-$(uname -r)" | grep -q 'Candidate: [0-9]'; then
+    apt-get install -y -q linux-generic
+    die "installed the current kernel with quota support ($(uname -r) has no extras in the archive). Reboot the VM, then run this again."
+  fi
   apt-get install -y -q linux-generic "linux-modules-extra-$(uname -r)"
   modprobe quota_v2 || die "kernel has no quota_v2 module; project quotas can't work"
 fi

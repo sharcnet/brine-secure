@@ -21,6 +21,9 @@ sshdir=${REVIEW_SSH_DIR:-$here/.ssh}
 local_test=${LOCAL_TEST:-0}   # 1 = the local Lima test VM: no OpenStack, never touch brine keys
 shared_key=${SHARED_TEST_KEY:-0}  # 1 = every reviewer uses one admin's own brine key (a pilot): never revoke it
 : "${VM_ADMIN:=ubuntu}" "${BRINE_URL:=https://brine.sharcnet.ca}"
+: "${WEB_AUTH:=basic}" "${SSO_ISSUER:=https://cilogon.org}" "${SSO_DOMAIN:=alliancecan.ca}"
+: "${SSO_IDP:=https://idp.alliancecan.ca/idp/shibboleth}" "${SSO_MFA:=https://refeds.org/profile/mfa}"
+: "${SSO_CIDRS:=75.2.49.220/32 99.83.186.75/32}"   # cilogon.org (AWS Global Accelerator)
 brine_host=${BRINE_URL#https://}; brine_host=${brine_host%%/*}
 
 # ---------- helpers ----------
@@ -63,6 +66,24 @@ vm_ssh() {
 # macOS tar would otherwise pack Apple metadata that GNU tar on the VM warns about.
 mac_tar=""; [[ $(uname) == Darwin ]] && mac_tar="--no-xattrs --no-mac-metadata"
 
+# Fetch the oauth2-proxy release for the VM's architecture into $here/.cache (once), check it
+# against the pins in vm/files/oauth2-proxy.sha256, and copy it into the source dir $1.
+fetch_oauth2_proxy() {
+  local dir=$1 arch pins=$here/vm/files/oauth2-proxy.sha256 f want ver got
+  arch=$(vm_ssh 'dpkg --print-architecture') || return 1
+  f=$(awk -v a="linux-$arch.tar.gz" '$2 ~ a"$" {print $2}' "$pins"); want=$(awk -v f="$f" '$2 == f {print $1}' "$pins")
+  ver=$(awk '/^# version [0-9]/ {print $3}' "$pins")
+  [[ -n $f && -n $want && -n $ver ]] || { echo "no pinned oauth2-proxy for $arch" >&2; return 1; }
+  mkdir -p "$here/.cache"
+  if [[ ! -f $here/.cache/$f ]]; then
+    curl -fsSL -o "$here/.cache/$f.part" "https://github.com/oauth2-proxy/oauth2-proxy/releases/download/v$ver/$f" || return 1
+    mv "$here/.cache/$f.part" "$here/.cache/$f"
+  fi
+  got=$( (sha256sum "$here/.cache/$f" 2>/dev/null || shasum -a 256 "$here/.cache/$f") | cut -d' ' -f1)
+  [[ $got == "$want" ]] || { rm -f "$here/.cache/$f"; echo "$f does not match its pinned SHA-256" >&2; return 1; }
+  cp "$here/.cache/$f" "$dir/$f"
+}
+
 # Copy vm/ plus a generated review.conf to /root/brine-review-src on the VM.
 push_src() {
   local t rc=0; t=$(mktemp -d)
@@ -72,7 +93,16 @@ push_src() {
     printf 'ADMIN_CIDRS=%q\n' "$ADMIN_CIDRS"
     printf 'QUOTA_GB=%q\n' "${QUOTA_GB:-2}"
     printf 'CTR_MEMORY=%q\nCTR_CPUS=%q\nCTR_PIDS=%q\n' "${CTR_MEMORY:-2g}" "${CTR_CPUS:-2}" "${CTR_PIDS:-256}"
+    printf 'WEB_AUTH=%q\nLOCAL_TEST=%q\n' "$WEB_AUTH" "$local_test"
+    printf 'SSO_HOST=%q\nSSO_CLIENT_ID=%q\nSSO_ISSUER=%q\n' "${SSO_HOST:-}" "${SSO_CLIENT_ID:-}" "$SSO_ISSUER"
+    printf 'SSO_IDP=%q\nSSO_MFA=%q\nSSO_DOMAIN=%q\nSSO_CIDRS=%q\n' "$SSO_IDP" "$SSO_MFA" "$SSO_DOMAIN" "$SSO_CIDRS"
+    printf 'CERT_PUSH_KEY=%q\nCERT_PUSH_CIDRS=%q\n' "${CERT_PUSH_KEY:-}" "${CERT_PUSH_CIDRS:-}"
+    printf 'ROOT_SSH_KEYS=%q\nROOT_SSH_CIDRS=%q\n' "${ROOT_SSH_KEYS:-}" "${ROOT_SSH_CIDRS:-}"
   } > "$t/review.conf"
+  if [[ $WEB_AUTH == sso ]]; then
+    [[ -n ${SSO_HOST:-} && -n ${SSO_CLIENT_ID:-} ]] || { rm -rf "$t"; die "WEB_AUTH=sso needs SSO_HOST and SSO_CLIENT_ID in review.env"; }
+    fetch_oauth2_proxy "$t" || { rm -rf "$t"; die "could not fetch a verified oauth2-proxy"; }
+  fi
   COPYFILE_DISABLE=1 tar $mac_tar -C "$t" -cf - . | vm_ssh 'sudo -n rm -rf /root/brine-review-src &&
     sudo -n install -d -m 0700 /root/brine-review-src &&
     sudo -n tar --no-same-owner -C /root/brine-review-src -xf -' || rc=$?
@@ -148,7 +178,10 @@ review activate <user> <checked-by> Switch the reviewer's web sign-in on
 review unload <user> <file>         Remove one application (conflict of interest)
 review remove <user>                Remove a reviewer, purge their data, revoke their key
 review revoke <user>                Revoke a reviewer's LiteLLM key only
-review web-password <user>          Set a new random web sign-in password and print it once
+review web-password <user>          Set a new random web sign-in password and print it once (WEB_AUTH=basic)
+review sso-secret [<file>]          Install the CILogon client secret (from a 0600 file, or typed)
+review web-cert <cert.pem> <key.pem>
+                                    Install a trusted certificate for SSO_HOST (cert.pem = full chain)
 review admin-keys <file>            Replace the VM admin account's authorized_keys (add/drop admins)
 review check                        Control-plane lock check and open connections
 review ssh                          Admin shell on the VM
@@ -291,6 +324,24 @@ case $cmd in
     printf '%s\n' "$pw" | vm_ssh "sudo -n /usr/local/sbin/web-password $1" >/dev/null
     echo "Web password for $1 (shown once; send it through a separate channel): $pw"
     unset pw ;;
+
+  sso-secret)
+    [[ $WEB_AUTH == sso ]] || echo "note: WEB_AUTH=$WEB_AUTH in review.env; the secret is used once it is sso" >&2
+    if [[ -n ${1:-} ]]; then
+      [[ -f $1 ]] || die "usage: review sso-secret [<file>]"
+      [[ $(stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1") == 600 ]] || die "$1 must be mode 0600"
+      vm_ssh 'sudo -n /usr/local/sbin/install-sso-secret' < "$1"
+    else
+      read -r -s -p "CILogon client secret: " sec; echo
+      printf '%s\n' "$sec" | vm_ssh 'sudo -n /usr/local/sbin/install-sso-secret'
+      unset sec
+    fi ;;
+
+  web-cert)
+    crt=${1:-} key=${2:-}; [[ -f $crt && -f $key ]] || die "usage: review web-cert <cert.pem> <key.pem>"
+    t=$(mktemp -d); cp "$crt" "$t/tls.crt"; ( umask 077; cp "$key" "$t/tls.key" )
+    COPYFILE_DISABLE=1 tar $mac_tar -C "$t" -cf - tls.crt tls.key | vm_ssh 'sudo -n /usr/local/sbin/install-web-cert'; rc=$?
+    rm -rf "$t"; exit $rc ;;
 
   admin-keys)
     # Replace the VM admin account's authorized_keys, e.g. to add or drop an admin. The file

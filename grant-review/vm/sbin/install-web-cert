@@ -1,0 +1,38 @@
+#!/bin/bash
+# install-web-cert              (a tar of tls.crt and tls.key arrives on stdin)
+#
+# Installs a publicly trusted certificate for the web page in place of the self-signed one,
+# after checking that the key matches, the chain is complete enough to verify, and the
+# certificate covers SSO_HOST for at least 7 more days. Then reloads nginx.
+# Two callers: `review web-cert` (an admin) and the certpush account (sshd forces this command
+# for it, e.g. the Ansible host), so the input is untrusted: size-capped, plain files only.
+source /usr/local/lib/brine-review/common.sh
+[[ $# -eq 0 ]] || die "usage: install-web-cert < tar(tls.crt tls.key)"
+[[ ${SSO_HOST:-} =~ ^[A-Za-z0-9.-]+$ ]] || die "SSO_HOST is not set in review.conf; the certificate can't be checked"
+by=${SUDO_USER:-root}
+base=$(mktemp -d); trap 'rm -rf "$base"' EXIT
+head -c 1048577 > "$base/in.tar"
+(( $(stat -c %s "$base/in.tar") <= 1048576 )) || die "input over 1 MiB"
+t=$base/x; mkdir "$t"
+tar -C "$t" --no-same-owner --no-same-permissions -xf "$base/in.tar" tls.crt tls.key 2>/dev/null \
+  || die "expected a tar with tls.crt and tls.key"
+for f in tls.crt tls.key; do
+  [[ -f $t/$f && ! -L $t/$f && $(stat -c %h "$t/$f") -eq 1 ]] || die "$f must be a plain file"
+done
+openssl x509 -in "$t/tls.crt" -noout || die "tls.crt is not a certificate"
+[[ $(openssl x509 -in "$t/tls.crt" -noout -pubkey | sha256sum) == $(openssl pkey -in "$t/tls.key" -pubout | sha256sum) ]] \
+  || die "tls.key doesn't match tls.crt"
+openssl x509 -in "$t/tls.crt" -noout -checkend $((7*86400)) >/dev/null || die "certificate expires within 7 days"
+how=-checkhost; [[ $SSO_HOST =~ ^[0-9.]+$ ]] && how=-checkip   # the local test VM uses an address
+openssl x509 -in "$t/tls.crt" -noout "$how" "$SSO_HOST" | grep -q 'does match' || die "certificate doesn't cover $SSO_HOST"
+openssl verify -untrusted "$t/tls.crt" "$t/tls.crt" >/dev/null 2>&1 \
+  || echo "note: the chain doesn't verify against the system store (fine if the intermediate is in tls.crt and the root is public)" >&2
+d=/etc/brine-review/web
+cp "$d/tls.crt" "$d/tls.crt.prev" 2>/dev/null || true
+cp "$d/tls.key" "$d/tls.key.prev" 2>/dev/null || true
+install -m 0644 "$t/tls.crt" "$d/tls.crt"
+install -m 0600 "$t/tls.key" "$d/tls.key"
+if nginx -t -q; then systemctl reload nginx
+else cp "$d/tls.crt.prev" "$d/tls.crt"; cp "$d/tls.key.prev" "$d/tls.key"; die "nginx rejected it; previous certificate restored"; fi
+rm -f "$d/tls.crt.prev" "$d/tls.key.prev"
+log "web certificate installed by $by: $(openssl x509 -in "$d/tls.crt" -noout -subject -enddate | tr '\n' ' ')"

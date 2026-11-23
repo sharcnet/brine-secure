@@ -12,9 +12,11 @@ u=$1 purge=false
 [[ ${2:-} == --purge-data ]] && purge=true
 valid_user "$u" || die "bad username: $u"
 
-# Login off first, so nobody gets in while the rest is torn down.
-rm -f -- "$PENDING_DIR/$u"
+# Login off first, so nobody gets in while the rest is torn down. Leaving $u off the active
+# list ends a signed-in session on its next request (oauth2-proxy, review-authz and nginx).
 for f in "$WEB_HT" "$WEB_HT.pending"; do [[ -f $f ]] && sed -i "/^$u:/d" "$f"; done
+write_web_access "$u"
+rm -f -- "$PENDING_DIR/$u"
 pkill -KILL -u "$u" 2>/dev/null || true
 
 systemctl stop "review-web@$u.service" "review-$u.service" 2>/dev/null || true
